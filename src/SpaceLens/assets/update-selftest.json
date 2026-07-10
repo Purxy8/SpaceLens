@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "9.9.9",
+  "tag": "v9.9.9",
+  "assetName": "SpaceLens-Setup.exe",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "sizeBytes": 123456,
+  "publishedUtc": "2026-07-10T00:00:00+00:00",
+  "notes": "SpaceLens update signature self-test.",
+  "signature": "6ZCuYdBlPiKFLlm4cKhwqdAgfSEOvQPFwAqZlMYz0Hay8hxQnBsZNGmb0nQ3tihQaDgn1nxsgfb2IdrgqhoDnA=="
+}
