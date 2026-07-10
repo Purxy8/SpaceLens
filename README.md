@@ -8,11 +8,11 @@ SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder,
 
 - Familiar decimal storage units (`B`, `KB`, `MB`, `GB`, and `TB`) throughout the interface
 - A brighter, more polished layout with clearer status feedback and subtle scan activity animation
-- Drive capacity, used space, free space, indexed files, and unindexed filesystem overhead shown separately
+- Drive capacity, used space, free space, accounted file allocation, and protected/system storage shown separately from the same scan snapshot
 - Allocated size on disk for sparse and compressed files, with honest approximation markers when Windows cannot report allocation
 - Categories for downloads, temporary files and caches, apps and games, Windows/system files, and personal files, plus independent screenshot and video filters
 - Category, media, search, and size sorting controls that remain independent and composable
-- Responsive background scanning, filtering, sorting, cancellation, and a virtualized largest-files table
+- Fast buffered Windows directory scanning with live files-per-second feedback, cancellation, background filtering/sorting, and a virtualized largest-files table
 - Validated completed-scan caching so the last results can be restored without rescanning at every launch
 - Recycle Bin deletion only, with file-identity and stale-file validation plus stronger confirmation for sensitive locations
 - Signed update manifests, bounded downloads, exact size and SHA-256 checks, and a pinned GitHub release source
@@ -20,7 +20,7 @@ SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder,
 
 ## Understanding scan totals
 
-Windows drive usage is authoritative. “Indexed files on disk” is the known allocated space of ordinary files that SpaceLens could access. It can be lower than total used space because NTFS metadata, restore points, reserved storage, inaccessible locations, and some hard-link behavior cannot be represented as normal files. When Windows does not expose allocation for an individual file, SpaceLens marks its displayed size as approximate instead of silently counting it as zero. SpaceLens shows the remaining difference as unindexed/overhead instead of pretending it is deletable data.
+Windows drive usage is authoritative. “Files accounted” is the allocated space represented by ordinary indexed files; sparse and compressed allocation is measured physically and hard-linked data is counted once. When Windows cannot expose an individual allocation, SpaceLens includes the explicit estimate and marks it with an asterisk instead of silently dropping it. “System / protected” is the remaining drive-used snapshot: NTFS metadata, restore points, reserved storage, protected locations, alternate streams, and similar Windows-managed data. It is not presented as directly deletable ordinary files.
 
 SpaceLens uses decimal labels: `1 KB = 1,000 B`, `1 MB = 1,000 KB`, and `1 GB = 1,000 MB`.
 
@@ -37,6 +37,8 @@ On Windows 10 or 11 (64-bit):
 3. Start SpaceLens, select a drive or folder, and choose **Scan now**.
 
 The release also contains a portable `SpaceLens.exe` that runs without installation. The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning.
+
+SpaceLens 1.3 can open saved scans from 1.2. Run one fresh scan after upgrading so the new scan-time system/protected snapshot and performance details are saved; later launches continue to restore completed scans automatically.
 
 ## Build from source
 

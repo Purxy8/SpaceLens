@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 — 2026-07-10
+
+- Replaced per-file handle probing with buffered Windows directory metadata scanning, dramatically improving scan throughput while retaining allocation size, timestamps, stable file IDs, sparse-file accounting, and hard-link deduplication.
+- Added live files-per-second feedback and larger, async-safe UI batches so fast scans remain responsive.
+- Fixed estimated allocations being excluded from drive and category totals, which made protected Windows files appear as unexplained missing space.
+- Replaced the ambiguous unindexed/overhead metric with clearer files-accounted and system/protected storage metrics captured against the same drive snapshot.
+- Added saved-scan summary metadata and backward-compatible v3 cache loading; older scans now request one refresh instead of showing a misleading residual.
+- Prevented stale rows from being recycled while a new filter or sort view is still being built.
+- Expanded scanner regression coverage for native-path availability, throughput, sparse files, hard links, reparse loops, long paths, cancellation, hostile entry validation, and cache migration.
+
 ## 1.2.0 — 2026-07-10
 
 - Replaced binary-looking `GiB`/`MiB` labels with familiar decimal `GB`/`MB`/`KB`/`B` units throughout the app.
