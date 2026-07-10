@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <SpaceLensVersion>1.2.0</SpaceLensVersion>
+    <SpaceLensVersion>1.3.0</SpaceLensVersion>
     <Version>$(SpaceLensVersion)</Version>
     <FileVersion>$(SpaceLensVersion).0</FileVersion>
     <InformationalVersion>$(SpaceLensVersion)</InformationalVersion>

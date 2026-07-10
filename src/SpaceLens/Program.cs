@@ -32,10 +32,11 @@ internal static class MediaTypes
     }
 }
 
-internal record ScanSnapshot(string Root, DateTime ScannedAt, List<FileItem> Files);
+internal readonly record struct ScanSummary(long DriveUsedBytes, int SkippedLocations, long ElapsedMilliseconds);
+internal record ScanSnapshot(string Root, DateTime ScannedAt, List<FileItem> Files, ScanSummary Summary = default);
 internal record TypeTotal(string Extension, int Count, long Bytes, int EstimatedCount = 0);
 internal record CategoryTotal(long Bytes, int Count, int EstimatedCount = 0);
-internal record ViewResult(List<FileItem> VisibleFiles, int FilteredCount, long FilteredBytes, long IndexedBytes, int EstimatedAllocationCount, int FilteredEstimatedAllocationCount, bool TypesTruncated, List<TypeTotal> Types, Dictionary<string, CategoryTotal>? Categories);
+internal record ViewResult(List<FileItem> VisibleFiles, int FilteredCount, long FilteredBytes, long FilteredEstimatedBytes, long IndexedBytes, long EstimatedAllocationBytes, int EstimatedAllocationCount, int FilteredEstimatedAllocationCount, bool TypesTruncated, List<TypeTotal> Types, Dictionary<string, CategoryTotal>? Categories);
 
 internal static class Program
 {
@@ -44,6 +45,8 @@ internal static class Program
     {
         CrashLog.Initialize();
         if (args.Contains("--self-test")) { Environment.ExitCode = SelfTest.Run() ? 0 : 1; return; }
+        int benchmarkIndex = Array.IndexOf(args, "--benchmark-scan"), reportIndex = Array.IndexOf(args, "--benchmark-report");
+        if (benchmarkIndex >= 0 && reportIndex >= 0 && benchmarkIndex + 1 < args.Length && reportIndex + 1 < args.Length) { Environment.ExitCode = ScannerBenchmark.Run(args[benchmarkIndex + 1], args[reportIndex + 1]); return; }
         int manifestIndex = Array.IndexOf(args, "--verify-update-manifest"), installerIndex = Array.IndexOf(args, "--installer");
         if (manifestIndex >= 0 && installerIndex >= 0 && manifestIndex + 1 < args.Length && installerIndex + 1 < args.Length) { Environment.ExitCode = UpdateService.VerifyRelease(args[manifestIndex + 1], args[installerIndex + 1]); return; }
         if (args.Contains("--uninstall-helper")) { ApplicationConfiguration.Initialize(); InstallerLifecycle.RunUninstallHelper(args); return; }
@@ -88,6 +91,7 @@ internal sealed class AnalyzerForm : Form
     private Dictionary<string, CategoryTotal> categoryTotals = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? cancellation;
     private long liveIndexedBytes;
+    private long liveEstimatedBytes;
     private int liveEstimatedCount;
     private DateTime? scannedAt;
     private string? sortColumn = "DiskSize";
@@ -99,7 +103,12 @@ internal sealed class AnalyzerForm : Form
     private readonly System.Windows.Forms.Timer searchTimer = new() { Interval = 275 };
     private CancellationTokenSource? viewCancellation;
     private int viewGeneration;
+    private bool viewUpdating;
     private long indexedBytesTotal;
+    private long estimatedBytesTotal;
+    private long scanDriveUsedBytes;
+    private int scanSkippedLocations;
+    private long scanElapsedMilliseconds;
     private bool cacheLoading;
     private CancellationTokenSource? cacheLoadCancellation;
     private string? resultsRoot;
@@ -181,7 +190,7 @@ internal sealed class AnalyzerForm : Form
 
         var metrics = new TableLayoutPanel { Dock = DockStyle.Top, Height = 116, BackColor = AppTheme.Canvas, Padding = new Padding(20, 9, 20, 8), ColumnCount = 6 };
         for (int i = 0; i < 6; i++) metrics.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 16.66f));
-        metrics.Controls.Add(Card("DRIVE CAPACITY", driveCapacity, AppTheme.Primary), 0, 0); metrics.Controls.Add(Card("DRIVE USED", driveUsed, AppTheme.Violet), 1, 0); metrics.Controls.Add(Card("DRIVE FREE", driveFree, AppTheme.Green), 2, 0); metrics.Controls.Add(Card("INDEXED ALLOCATION*", indexedSize, AppTheme.Teal), 3, 0); metrics.Controls.Add(Card("UNINDEXED / OVERHEAD", unindexedSize, AppTheme.Amber), 4, 0); metrics.Controls.Add(Card("FILES INDEXED", fileCount, Color.FromArgb(82, 105, 137)), 5, 0);
+        metrics.Controls.Add(Card("DRIVE CAPACITY", driveCapacity, AppTheme.Primary), 0, 0); metrics.Controls.Add(Card("DRIVE USED", driveUsed, AppTheme.Violet), 1, 0); metrics.Controls.Add(Card("DRIVE FREE", driveFree, AppTheme.Green), 2, 0); metrics.Controls.Add(Card("FILES ACCOUNTED", indexedSize, AppTheme.Teal), 3, 0); metrics.Controls.Add(Card("SYSTEM / PROTECTED", unindexedSize, AppTheme.Amber), 4, 0); metrics.Controls.Add(Card("FILES INDEXED", fileCount, Color.FromArgb(82, 105, 137)), 5, 0);
 
         var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(16, 6), Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold) };
         var filesTab = new TabPage("Largest files") { Padding = new Padding(8), BackColor = Color.White, UseVisualStyleBackColor = false }; filesTab.Controls.Add(filesGrid);
@@ -195,10 +204,12 @@ internal sealed class AnalyzerForm : Form
         bottomActions.Controls.Add(deleteButton); bottomActions.Controls.Add(filterSummary);
         var statusStrip = new StatusStrip { BackColor = Color.White, SizingGrip = false, Items = { status, freshness, progress } };
         Controls.Add(tabArea); Controls.Add(bottomActions); Controls.Add(metrics); Controls.Add(picker); Controls.Add(activityStrip); Controls.Add(header); Controls.Add(statusStrip);
-        tips.SetToolTip(unindexedSize, "Drive space not represented by accessible ordinary files: NTFS metadata, restore points, reserved storage, protected locations, and similar Windows overhead.");
-        tips.SetToolTip(indexedSize, "Known allocated size of accessible files. Sparse and compressed files are measured physically and NTFS hard-link allocation is counted once. An asterisk means one or more files use an explicit approximate value that is excluded from this total.");
+        tips.SetToolTip(unindexedSize, "Space Windows reports as used but does not expose as ordinary files: NTFS metadata, restore points, reserved storage, protected locations, alternate streams, and similar system storage.");
+        tips.SetToolTip(indexedSize, "Allocated size represented by indexed files. Sparse and compressed files are measured physically and NTFS hard-link allocation is counted once. An asterisk means the total contains one or more explicit estimates.");
         tips.SetToolTip(categoryList, "Click a category to filter. Cleanup candidates combines Downloads with recognized temporary and cache files; review every file before recycling it. An asterisk marks categories containing one or more allocation estimates.");
-        tips.SetToolTip(typesGrid, "File-type totals use known allocation. An asterisk marks a type containing one or more approximate file allocations.");
+        tips.SetToolTip(typesGrid, "File-type totals include measured allocation and clearly marked estimates. An asterisk marks a type containing one or more approximate allocations.");
+        tips.SetToolTip(driveUsed, "For a current complete drive scan, this is the used-space snapshot captured with that scan. Run Scan now to refresh it.");
+        tips.SetToolTip(driveFree, "For a current complete drive scan, this is the free-space snapshot captured with that scan. Run Scan now to refresh it.");
         tips.SetToolTip(metrics, "SpaceLens uses decimal display units: 1 KB = 1,000 bytes, 1 MB = 1,000,000 bytes, and 1 GB = 1,000,000,000 bytes.");
         UpdateDriveMetrics();
         Shown += async (_, _) => { await LoadCachedAsync(location.Text); if (UpdateService.AutomaticCheckIsDue()) _ = CheckForUpdatesAsync(false); };
@@ -215,11 +226,18 @@ internal sealed class AnalyzerForm : Form
         {
             var snapshot = await Task.Run(() => { var loaded = ScanCache.Load(root, cacheToken); if (loaded is not null) for (int i = 0; i < loaded.Files.Count; i++) { if ((i & 4095) == 0) cacheToken.ThrowIfCancellationRequested(); var item = loaded.Files[i]; loaded.Files[i] = item with { Category = Classify(item.Path) }; } return loaded; }, cacheToken);
             if (generation != cacheLoadGeneration || cancellation is not null || NormalizeLocation(location.Text) != requestedRoot) return;
-            if (snapshot is null) { allFiles.Clear(); resultsRoot = null; indexedBytesTotal = 0; scannedAt = null; PopulateResults(); status.Text = "No saved scan for this location. Click Scan now."; freshness.Text = "NOT YET SCANNED"; }
-            else { allFiles.Clear(); allFiles.AddRange(snapshot.Files); indexedBytesTotal = snapshot.Files.Where(item => !item.AllocationEstimated).Aggregate(0L, (total, item) => checked(total + item.DiskBytes)); resultsRoot = Path.GetFullPath(snapshot.Root); scannedAt = snapshot.ScannedAt; PopulateResults(); status.Text = $"Showing saved results from {snapshot.ScannedAt:g}. Click Scan now to refresh."; freshness.Text = $"SAVED SCAN: {Age(snapshot.ScannedAt)}"; }
+            if (snapshot is null) { allFiles.Clear(); resultsRoot = null; indexedBytesTotal = estimatedBytesTotal = scanDriveUsedBytes = scanElapsedMilliseconds = 0; scanSkippedLocations = 0; scannedAt = null; PopulateResults(); status.Text = "No saved scan for this location. Click Scan now."; freshness.Text = "NOT YET SCANNED"; }
+            else
+            {
+                allFiles.Clear(); allFiles.AddRange(snapshot.Files);
+                indexedBytesTotal = snapshot.Files.Where(item => !item.AllocationEstimated).Aggregate(0L, (total, item) => checked(total + item.DiskBytes));
+                estimatedBytesTotal = snapshot.Files.Where(item => item.AllocationEstimated).Aggregate(0L, (total, item) => checked(total + item.DiskBytes));
+                scanDriveUsedBytes = snapshot.Summary.DriveUsedBytes; scanSkippedLocations = snapshot.Summary.SkippedLocations; scanElapsedMilliseconds = snapshot.Summary.ElapsedMilliseconds;
+                resultsRoot = Path.GetFullPath(snapshot.Root); scannedAt = snapshot.ScannedAt; PopulateResults(); status.Text = snapshot.Summary.DriveUsedBytes > 0 ? $"Showing saved results from {snapshot.ScannedAt:g}. Click Scan now to refresh." : $"Showing a compatible older saved scan from {snapshot.ScannedAt:g}. Run Scan now once to calculate system/protected storage."; freshness.Text = $"SAVED SCAN: {Age(snapshot.ScannedAt)}";
+            }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (generation == cacheLoadGeneration) { allFiles.Clear(); resultsRoot = null; indexedBytesTotal = 0; scannedAt = null; PopulateResults(); status.Text = $"Saved scan could not be loaded: {ex.Message}"; freshness.Text = "CACHE UNAVAILABLE"; } }
+        catch (Exception ex) { if (generation == cacheLoadGeneration) { allFiles.Clear(); resultsRoot = null; indexedBytesTotal = estimatedBytesTotal = scanDriveUsedBytes = scanElapsedMilliseconds = 0; scanSkippedLocations = 0; scannedAt = null; PopulateResults(); status.Text = $"Saved scan could not be loaded: {ex.Message}"; freshness.Text = "CACHE UNAVAILABLE"; } }
         finally { if (generation == cacheLoadGeneration) { cacheLoading = false; SetCacheLoading(false); progress.Visible = false; UpdateDriveMetrics(); } }
     }
 
@@ -227,79 +245,31 @@ internal sealed class AnalyzerForm : Form
     {
         var root = location.Text.Trim();
         if (!Directory.Exists(root)) { MessageBox.Show(this, "Choose an existing drive or folder.", "Location not found", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-        cacheLoadCancellation?.Cancel(); Interlocked.Increment(ref cacheLoadGeneration); cacheLoading = false; cancellation?.Dispose(); cancellation = new CancellationTokenSource(); InvalidateCacheSaves(root); allFiles.Clear(); resultsRoot = null; ClearVisibleGrid(); categoryTotals.Clear(); indexedBytesTotal = 0; filterSummary.Text = "Scanning — delete actions are disabled"; liveIndexedBytes = 0; liveEstimatedCount = 0; scannedAt = null; searchTimer.Stop(); ScanCache.RememberLastLocation(root); SetScanning(true); UpdateDriveMetrics(); status.Text = $"Scanning {root}…"; freshness.Text = "LIVE SCAN";
+        cacheLoadCancellation?.Cancel(); Interlocked.Increment(ref cacheLoadGeneration); cacheLoading = false; cancellation?.Dispose(); cancellation = new CancellationTokenSource(); InvalidateCacheSaves(root); allFiles.Clear(); resultsRoot = null; ClearVisibleGrid(); categoryTotals.Clear(); indexedBytesTotal = estimatedBytesTotal = scanDriveUsedBytes = scanElapsedMilliseconds = 0; scanSkippedLocations = 0; filterSummary.Text = "Scanning — delete actions are disabled"; liveIndexedBytes = liveEstimatedBytes = 0; liveEstimatedCount = 0; scannedAt = null; searchTimer.Stop(); ScanCache.RememberLastLocation(root); SetScanning(true); UpdateDriveMetrics(); status.Text = $"Scanning {root}…"; freshness.Text = "LIVE SCAN";
+        var scanTimer = System.Diagnostics.Stopwatch.StartNew();
         var reporter = new Progress<(List<FileItem> Batch, int Skipped)>(update =>
         {
-            allFiles.AddRange(update.Batch); liveIndexedBytes += update.Batch.Where(f => !f.AllocationEstimated).Sum(f => f.DiskBytes); liveEstimatedCount += update.Batch.Count(f => f.AllocationEstimated); fileCount.Text = allFiles.Count.ToString("N0"); indexedSize.Text = FormatSize(liveIndexedBytes) + (liveEstimatedCount > 0 ? "*" : "");
-            status.Text = $"Scanning… {allFiles.Count:N0} files indexed; {update.Skipped:N0} inaccessible or linked locations skipped{(liveEstimatedCount == 0 ? "" : $"; {liveEstimatedCount:N0} allocation estimates")}";
+            allFiles.AddRange(update.Batch); liveIndexedBytes += update.Batch.Where(f => !f.AllocationEstimated).Sum(f => f.DiskBytes); liveEstimatedBytes += update.Batch.Where(f => f.AllocationEstimated).Sum(f => f.DiskBytes); liveEstimatedCount += update.Batch.Count(f => f.AllocationEstimated); fileCount.Text = allFiles.Count.ToString("N0"); indexedSize.Text = FormatSize(checked(liveIndexedBytes + liveEstimatedBytes)) + (liveEstimatedCount > 0 ? "*" : "");
+            double seconds = Math.Max(0.001, scanTimer.Elapsed.TotalSeconds); long rate = (long)(allFiles.Count / seconds);
+            status.Text = $"Scanning… {allFiles.Count:N0} files · {rate:N0} files/s · {update.Skipped:N0} inaccessible or linked locations skipped{(liveEstimatedCount == 0 ? "" : $" · {liveEstimatedCount:N0} allocation estimates")}";
         });
         bool completed = false;
         try
         {
-            var skipped = await Task.Run(() => ScanFiles(root, reporter, cancellation.Token)); completed = true; resultsRoot = Path.GetFullPath(root); scannedAt = DateTime.Now; stopButton.Enabled = false;
-            status.Text = $"Scan complete: {allFiles.Count:N0} files indexed; {skipped:N0} inaccessible or linked locations skipped. Saving results…";
-            var snapshot = new ScanSnapshot(root, scannedAt.Value, [.. allFiles]); await SaveCacheSnapshotAsync(snapshot, true);
-            status.Text = $"Scan complete and saved. {allFiles.Count:N0} files indexed; {skipped:N0} inaccessible or linked locations skipped."; freshness.Text = "SAVED JUST NOW";
+            var skipped = await Task.Run(() => ScanFiles(root, reporter, cancellation.Token)); scanTimer.Stop(); completed = true; resultsRoot = Path.GetFullPath(root); scannedAt = DateTime.Now; stopButton.Enabled = false;
+            scanDriveUsedBytes = TryGetWholeDriveUsed(root); scanSkippedLocations = skipped; scanElapsedMilliseconds = scanTimer.ElapsedMilliseconds;
+            long finalRate = (long)(allFiles.Count / Math.Max(0.001, scanTimer.Elapsed.TotalSeconds));
+            status.Text = $"Scan complete: {allFiles.Count:N0} files · {finalRate:N0} files/s · {skipped:N0} inaccessible or linked locations skipped. Saving results…";
+            var summary = new ScanSummary(scanDriveUsedBytes, skipped, scanElapsedMilliseconds); var snapshot = new ScanSnapshot(root, scannedAt.Value, [.. allFiles], summary); await SaveCacheSnapshotAsync(snapshot, true);
+            status.Text = $"Scan complete and saved in {scanTimer.Elapsed.TotalSeconds:N1}s · {allFiles.Count:N0} files · {finalRate:N0} files/s · {skipped:N0} locations skipped."; freshness.Text = "SAVED JUST NOW";
         }
         catch (OperationCanceledException) { status.Text = $"Scan stopped. Partial results are shown but were not saved ({allFiles.Count:N0} files)."; freshness.Text = "PARTIAL — NOT SAVED"; }
         catch (Exception ex) { status.Text = $"Scan error: {ex.Message}"; freshness.Text = "SCAN INCOMPLETE"; }
-        finally { if (!completed && allFiles.Count > 0) resultsRoot = Path.GetFullPath(root); cancellation?.Dispose(); cancellation = null; SetScanning(false); PopulateResults(); if (!completed) UpdateDriveMetrics(); }
+        finally { scanTimer.Stop(); if (!completed && allFiles.Count > 0) resultsRoot = Path.GetFullPath(root); cancellation?.Dispose(); cancellation = null; SetScanning(false); PopulateResults(); if (!completed) UpdateDriveMetrics(); }
     }
 
     internal static int ScanFiles(string root, IProgress<(List<FileItem>, int)> progress, CancellationToken token)
-    {
-        var pending = new Stack<string>(); pending.Push(root); int skipped = 0; var batch = new List<FileItem>(2000);
-        var visitedDirectories = new HashSet<NativeFileId>(); var hardLinkedFiles = new HashSet<NativeFileId>();
-        uint rootVolume = 0;
-        if (NativeFileIdentity.TryGet(root, true, out var rootIdentity)) { visitedDirectories.Add(rootIdentity.Id); rootVolume = rootIdentity.Id.VolumeSerial; }
-        while (pending.Count > 0)
-        {
-            token.ThrowIfCancellationRequested(); var directory = pending.Pop();
-            try
-            {
-                foreach (var child in Directory.EnumerateDirectories(directory))
-                {
-                    token.ThrowIfCancellationRequested();
-                    try
-                    {
-                        var info = new DirectoryInfo(child); bool reparse = (info.Attributes & FileAttributes.ReparsePoint) != 0;
-                        if (reparse && info.LinkTarget is not null) { skipped++; continue; }
-                        if (NativeFileIdentity.TryGet(child, true, out var identity))
-                        {
-                            if ((rootVolume != 0 && identity.Id.VolumeSerial != rootVolume) || !visitedDirectories.Add(identity.Id)) { skipped++; continue; }
-                        }
-                        else if (reparse) { skipped++; continue; }
-                        pending.Push(child);
-                    }
-                    catch { skipped++; }
-                }
-            }
-            catch { skipped++; }
-            try
-            {
-                foreach (var path in Directory.EnumerateFiles(directory))
-                {
-                    token.ThrowIfCancellationRequested();
-                    try
-                    {
-                        var info = new FileInfo(path); FileAttributes attributes = info.Attributes; if ((attributes & FileAttributes.ReparsePoint) != 0 && info.LinkTarget is not null) { skipped++; continue; } long logical = info.Length;
-                        bool hasIdentity = NativeFileIdentity.TryGet(path, false, out var identity); long? measured = hasIdentity ? identity.AllocatedBytes : null; measured ??= NativeDiskSize.TryAllocatedBytes(path); bool estimated = measured is null; long allocated = measured ?? logical;
-                        uint volumeSerial = 0; ulong fileIndex = 0;
-                        if (hasIdentity)
-                        {
-                            volumeSerial = identity.Id.VolumeSerial; fileIndex = identity.Id.FileIndex;
-                            if (identity.NumberOfLinks > 1 && !hardLinkedFiles.Add(identity.Id)) { allocated = 0; estimated = false; }
-                        }
-                        batch.Add(new(path, allocated, logical, info.LastWriteTime, Classify(path), info.CreationTime, estimated, volumeSerial, fileIndex));
-                    }
-                    catch { skipped++; }
-                    if (batch.Count >= 2000) { progress.Report((batch, skipped)); batch = new List<FileItem>(2000); }
-                }
-            }
-            catch { skipped++; }
-        }
-        if (batch.Count > 0) progress.Report((batch, skipped)); return skipped;
-    }
+        => FastFileScanner.Scan(root, progress, token);
 
     private void PopulateResults(bool refreshCategories = true) => _ = PopulateResultsAsync(refreshCategories);
 
@@ -307,23 +277,23 @@ internal sealed class AnalyzerForm : Form
     {
         viewCancellation?.Cancel(); viewCancellation?.Dispose(); viewCancellation = new CancellationTokenSource(); CancellationToken token = viewCancellation.Token;
         int generation = Interlocked.Increment(ref viewGeneration); FileItem[] snapshot = [.. allFiles]; string category = activeCategory; string media = activeMedia; string text = search.Text.Trim(); string? column = sortColumn; bool ascending = sortAscending;
-        filterSummary.Text = $"Updating view… category: {category} · media: {media}";
+        viewUpdating = true; deleteButton.Enabled = false; filesGrid.ClearSelection(); filesGrid.Enabled = false; if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = false; filterSummary.Text = $"Updating view… category: {category} · media: {media}";
         try
         {
             ViewResult result = await Task.Run(() => BuildView(snapshot, category, media, text, column, ascending, refreshCategories, token), token);
             if (token.IsCancellationRequested || generation != viewGeneration || IsDisposed) return;
-            indexedBytesTotal = result.IndexedBytes; if (result.Categories is not null) categoryTotals = result.Categories;
+            indexedBytesTotal = result.IndexedBytes; estimatedBytesTotal = result.EstimatedAllocationBytes; if (result.Categories is not null) categoryTotals = result.Categories;
             visibleFiles = result.VisibleFiles; filesGrid.ClearSelection(); filesGrid.RowCount = 0; filesGrid.RowCount = visibleFiles.Count; filesGrid.Invalidate();
-            visibleTypes = result.Types; visibleTypesBytes = result.FilteredBytes; typesGrid.RowCount = 0; typesGrid.RowCount = visibleTypes.Count; typesGrid.Invalidate();
-            indexedSize.Text = FormatSize(result.IndexedBytes) + (result.EstimatedAllocationCount > 0 ? "*" : ""); fileCount.Text = snapshot.Length.ToString("N0");
-            string displayNote = result.FilteredCount > result.VisibleFiles.Count ? $"{result.FilteredCount:N0} matching; displaying the largest {result.VisibleFiles.Count:N0}" : $"Showing {result.FilteredCount:N0} files";
-            string estimateNote = result.FilteredEstimatedAllocationCount == 0 ? "" : $" + {result.FilteredEstimatedAllocationCount:N0} estimated";
+            visibleTypes = result.Types; visibleTypesBytes = checked(result.FilteredBytes + result.FilteredEstimatedBytes); typesGrid.RowCount = 0; typesGrid.RowCount = visibleTypes.Count; typesGrid.Invalidate();
+            indexedSize.Text = FormatSize(checked(result.IndexedBytes + result.EstimatedAllocationBytes)) + (result.EstimatedAllocationCount > 0 ? "*" : ""); fileCount.Text = snapshot.Length.ToString("N0");
+            string displayNote = result.FilteredCount > result.VisibleFiles.Count ? $"{result.FilteredCount:N0} matching; displaying the first {result.VisibleFiles.Count:N0} for this sort" : $"Showing {result.FilteredCount:N0} files";
+            string estimateNote = result.FilteredEstimatedAllocationCount == 0 ? "" : $" · {result.FilteredEstimatedAllocationCount:N0} estimated";
             string typeNote = result.TypesTruncated ? " · file-type list limited" : "";
-            filterSummary.Text = $"{displayNote} · {FormatSize(result.FilteredBytes)} known{estimateNote} · category: {category} · media: {media}{(text.Length == 0 ? "" : $" · search: {text}")}{typeNote}";
-            if (refreshCategories) PopulateCategoryList(category); UpdateSortGlyph(); deleteButton.Enabled = cancellation is null && !cacheLoading && result.FilteredCount > 0; UpdateDriveMetrics();
+            filterSummary.Text = $"{displayNote} · {FormatSize(checked(result.FilteredBytes + result.FilteredEstimatedBytes))} accounted{(result.FilteredEstimatedAllocationCount > 0 ? "*" : "")}{estimateNote} · category: {category} · media: {media}{(text.Length == 0 ? "" : $" · search: {text}")}{typeNote}";
+            viewUpdating = false; filesGrid.Enabled = cancellation is null && !cacheLoading; if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = filesGrid.Enabled; if (refreshCategories) PopulateCategoryList(category); UpdateSortGlyph(); deleteButton.Enabled = filesGrid.Enabled && result.FilteredCount > 0; UpdateDriveMetrics();
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (generation == viewGeneration && !IsDisposed) { filterSummary.Text = "Could not update this view."; status.Text = $"View error: {ex.Message}"; } }
+        catch (Exception ex) { if (generation == viewGeneration && !IsDisposed) { viewUpdating = false; filesGrid.Enabled = cancellation is null && !cacheLoading; if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = filesGrid.Enabled; filterSummary.Text = "Could not update this view."; status.Text = $"View error: {ex.Message}"; } }
     }
 
     internal static bool MatchesCategory(FileItem item, string category) => category switch
@@ -344,20 +314,20 @@ internal sealed class AnalyzerForm : Form
         const int visibleLimit = 10_000;
         var visibleQueue = new PriorityQueue<FileItem, FileItem>(new WorstFirstComparer(column, ascending));
         var typeTotals = new Dictionary<string, CategoryTotal>(StringComparer.OrdinalIgnoreCase); Dictionary<string, CategoryTotal>? categories = includeCategories ? new(StringComparer.OrdinalIgnoreCase) : null;
-        long indexed = 0, filteredBytes = 0; int filteredCount = 0, estimatedCount = 0, filteredEstimatedCount = 0;
+        long indexed = 0, estimatedBytes = 0, filteredBytes = 0, filteredEstimatedBytes = 0; int filteredCount = 0, estimatedCount = 0, filteredEstimatedCount = 0;
         for (int i = 0; i < source.Count; i++)
         {
-            if ((i & 4095) == 0) token.ThrowIfCancellationRequested(); FileItem item = source[i]; long knownBytes = item.AllocationEstimated ? 0 : item.DiskBytes;
-            if (item.AllocationEstimated) estimatedCount++; else indexed = checked(indexed + item.DiskBytes);
-            if (categories is not null) AddTotal(categories, item.Category, knownBytes, item.AllocationEstimated);
+            if ((i & 4095) == 0) token.ThrowIfCancellationRequested(); FileItem item = source[i];
+            if (item.AllocationEstimated) { estimatedCount++; estimatedBytes = checked(estimatedBytes + item.DiskBytes); } else indexed = checked(indexed + item.DiskBytes);
+            if (categories is not null) AddTotal(categories, item.Category, item.DiskBytes, item.AllocationEstimated);
             if (!MatchesCategory(item, category) || !MatchesMedia(item, media) || (text.Length > 0 && !item.Path.Contains(text, StringComparison.OrdinalIgnoreCase))) continue;
-            filteredCount++; if (item.AllocationEstimated) filteredEstimatedCount++; else filteredBytes = checked(filteredBytes + item.DiskBytes); AddTotal(typeTotals, item.Extension, knownBytes, item.AllocationEstimated);
+            filteredCount++; if (item.AllocationEstimated) { filteredEstimatedCount++; filteredEstimatedBytes = checked(filteredEstimatedBytes + item.DiskBytes); } else filteredBytes = checked(filteredBytes + item.DiskBytes); AddTotal(typeTotals, item.Extension, item.DiskBytes, item.AllocationEstimated);
             if (visibleQueue.Count < visibleLimit) visibleQueue.Enqueue(item, item);
             else if (CompareFiles(item, visibleQueue.Peek(), column, ascending) < 0) { visibleQueue.Dequeue(); visibleQueue.Enqueue(item, item); }
         }
         token.ThrowIfCancellationRequested(); var visible = visibleQueue.UnorderedItems.Select(entry => entry.Element).ToList(); visible.Sort((left, right) => CompareFiles(left, right, column, ascending));
         bool typesTruncated = typeTotals.Count > 5000; var types = typeTotals.Select(pair => new TypeTotal(pair.Key, pair.Value.Count, pair.Value.Bytes, pair.Value.EstimatedCount)).OrderByDescending(item => item.Bytes).ThenBy(item => item.Extension, StringComparer.OrdinalIgnoreCase).Take(5000).ToList();
-        return new(visible, filteredCount, filteredBytes, indexed, estimatedCount, filteredEstimatedCount, typesTruncated, types, categories);
+        return new(visible, filteredCount, filteredBytes, filteredEstimatedBytes, indexed, estimatedBytes, estimatedCount, filteredEstimatedCount, typesTruncated, types, categories);
     }
 
     private static void AddTotal(Dictionary<string, CategoryTotal> totals, string key, long bytes, bool estimated) { totals.TryGetValue(key, out var current); totals[key] = new(checked((current?.Bytes ?? 0) + bytes), (current?.Count ?? 0) + 1, (current?.EstimatedCount ?? 0) + (estimated ? 1 : 0)); }
@@ -397,7 +367,7 @@ internal sealed class AnalyzerForm : Form
         try
         {
             categoryList.BeginUpdate(); categoryList.Items.Clear();
-            long allBytes = indexedBytesTotal; int allCount = allFiles.Count;
+            long allBytes = checked(indexedBytesTotal + estimatedBytesTotal); int allCount = allFiles.Count;
             foreach (string key in categoryFilter.Items.Cast<string>())
             {
                 long bytes; int count, estimates;
@@ -432,7 +402,7 @@ internal sealed class AnalyzerForm : Form
 
     private void RecycleSelected()
     {
-        if (cancellation is not null || cacheLoading || resultsRoot is null || NormalizeLocation(location.Text) != NormalizeLocation(resultsRoot)) return;
+        if (cancellation is not null || cacheLoading || viewUpdating || resultsRoot is null || NormalizeLocation(location.Text) != NormalizeLocation(resultsRoot)) return;
         var selected = filesGrid.SelectedRows.Cast<DataGridViewRow>().Select(r => FileAt(r.Index)).Where(f => f is not null).Cast<FileItem>().Distinct().ToList();
         if (selected.Count == 0 && CurrentItem() is FileItem current) selected.Add(current);
         if (selected.Count == 0) { MessageBox.Show(this, "Select one or more complete rows first.", "Nothing selected", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
@@ -441,7 +411,7 @@ internal sealed class AnalyzerForm : Form
 
     private void RecycleItems(List<FileItem> selected)
     {
-        if (cancellation is not null || cacheLoading || resultsRoot is null || NormalizeLocation(location.Text) != NormalizeLocation(resultsRoot)) return;
+        if (cancellation is not null || cacheLoading || viewUpdating || resultsRoot is null || NormalizeLocation(location.Text) != NormalizeLocation(resultsRoot)) return;
         ReclaimEstimate reclaim = EstimateReclaim(selected); bool sensitive = selected.Any(IsSensitivePath);
         string warning = sensitive ? "\n\nWARNING: This selection includes system or application files. Removing them can break Windows or installed software." : "";
         string examples = string.Join("\n", selected.Take(4).Select(f => f.Path)); if (selected.Count > 4) examples += $"\n…and {selected.Count - 4} more";
@@ -471,7 +441,7 @@ internal sealed class AnalyzerForm : Form
             allFiles.RemoveAll(item => removedPaths.Contains(item.Path)); RebalanceHardLinkAllocations(affectedLinks);
         }
         PopulateResults(); status.Text = $"Moved {removed} file{(removed == 1 ? "" : "s")} to the Recycle Bin{(stale == 0 ? "" : $"; removed {stale} missing file record{(stale == 1 ? "" : "s")}")}. Empty the bin to reclaim its space.";
-        if (removedPaths.Count > 0 && scannedAt is DateTime time && resultsRoot is string root) QueueCacheSave(new ScanSnapshot(root, time, [.. allFiles]));
+        if (removedPaths.Count > 0 && scannedAt is DateTime time && resultsRoot is string root) QueueCacheSave(new ScanSnapshot(root, time, [.. allFiles], new ScanSummary(scanDriveUsedBytes, scanSkippedLocations, scanElapsedMilliseconds)));
         if (failures.Count > 0) MessageBox.Show(this, string.Join("\n", failures.Take(8)), "Some files were skipped", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
@@ -481,7 +451,8 @@ internal sealed class AnalyzerForm : Form
         foreach (var item in selected)
         {
             if (item.FileIndex == 0) { bytes = checked(bytes + item.DiskBytes); estimated |= item.AllocationEstimated; continue; }
-            var id = new NativeFileId(item.VolumeSerial, item.FileIndex); if (!identities.TryGetValue(id, out var group)) { group = []; identities.Add(id, group); } group.Add(item);
+            var id = new NativeFileId(item.VolumeSerial, item.FileIndex); if (!identities.TryGetValue(id, out var group)) { group = []; identities.Add(id, group); }
+            group.Add(item);
         }
         foreach (var pair in identities)
         {
@@ -511,7 +482,8 @@ internal sealed class AnalyzerForm : Form
         for (int i = 0; i < allFiles.Count; i++)
         {
             var item = allFiles[i]; var id = new NativeFileId(item.VolumeSerial, item.FileIndex); if (!affected.Contains(id)) continue;
-            if (!groups.TryGetValue(id, out var indices)) { indices = []; groups.Add(id, indices); } indices.Add(i);
+            if (!groups.TryGetValue(id, out var indices)) { indices = []; groups.Add(id, indices); }
+            indices.Add(i);
         }
         foreach (var indices in groups.Values)
         {
@@ -537,10 +509,39 @@ internal sealed class AnalyzerForm : Form
         try
         {
             string full = Path.GetFullPath(location.Text).TrimEnd(Path.DirectorySeparatorChar); string root = (Path.GetPathRoot(full) ?? "").TrimEnd(Path.DirectorySeparatorChar); var drive = new DriveInfo(root + Path.DirectorySeparatorChar);
-            long used = drive.TotalSize - drive.TotalFreeSpace; long indexed = indexedBytesTotal; driveCapacity.Text = FormatSize(drive.TotalSize); driveFree.Text = FormatSize(drive.TotalFreeSpace); driveUsed.Text = FormatSize(used);
-            unindexedSize.Text = string.Equals(full, root, StringComparison.OrdinalIgnoreCase) && allFiles.Count > 0 && scannedAt is not null ? indexed <= used ? FormatSize(used - indexed) : "Overlap detected" : "—";
+            long liveUsed = drive.TotalSize - drive.TotalFreeSpace; bool wholeDriveScan = string.Equals(full, root, StringComparison.OrdinalIgnoreCase) && allFiles.Count > 0 && scannedAt is not null; bool hasScanSnapshot = wholeDriveScan && scanDriveUsedBytes > 0;
+            long usedAtScan = hasScanSnapshot ? scanDriveUsedBytes : liveUsed; long accounted = checked(indexedBytesTotal + estimatedBytesTotal);
+            driveCapacity.Text = FormatSize(drive.TotalSize); driveFree.Text = FormatSize(Math.Max(0, drive.TotalSize - usedAtScan)); driveUsed.Text = FormatSize(usedAtScan);
+            if (hasScanSnapshot)
+            {
+                long protectedBytes = CalculateProtectedBytes(usedAtScan, indexedBytesTotal, estimatedBytesTotal); unindexedSize.Text = FormatSize(protectedBytes);
+                string estimates = estimatedBytesTotal == 0 ? "" : $" The accounted total includes {FormatSize(estimatedBytesTotal)} of explicit estimates.";
+                string overlap = accounted <= usedAtScan ? "" : $" Files changed during the scan or estimates exceeded current allocation, producing a {FormatSize(accounted - usedAtScan)} temporary overlap.";
+                string skipped = scanSkippedLocations == 0 ? "" : $" {scanSkippedLocations:N0} inaccessible or linked locations were skipped.";
+                tips.SetToolTip(unindexedSize, $"Space used at scan time but not represented by ordinary indexed files: NTFS metadata, restore points, reserved storage, protected locations, alternate streams, and similar Windows storage.{skipped}{estimates}{overlap}");
+            }
+            else
+            {
+                unindexedSize.Text = wholeDriveScan ? "RESCAN" : "—";
+                tips.SetToolTip(unindexedSize, wholeDriveScan ? "This saved scan predates system/protected snapshot accounting. Run Scan now once to calculate it accurately." : "System/protected storage is calculated only for a complete drive scan.");
+            }
         }
-        catch { driveCapacity.Text = driveUsed.Text = driveFree.Text = unindexedSize.Text = "—"; }
+        catch { driveCapacity.Text = driveUsed.Text = driveFree.Text = unindexedSize.Text = "—"; tips.SetToolTip(unindexedSize, "System/protected storage is unavailable until a complete drive scan succeeds."); }
+    }
+
+    private static long TryGetWholeDriveUsed(string locationPath)
+    {
+        try
+        {
+            string full = Path.GetFullPath(locationPath).TrimEnd(Path.DirectorySeparatorChar); string root = (Path.GetPathRoot(full) ?? "").TrimEnd(Path.DirectorySeparatorChar);
+            if (!string.Equals(full, root, StringComparison.OrdinalIgnoreCase)) return 0; var drive = new DriveInfo(root + Path.DirectorySeparatorChar); return checked(drive.TotalSize - drive.TotalFreeSpace);
+        }
+        catch { return 0; }
+    }
+
+    internal static long CalculateProtectedBytes(long driveUsedBytes, long knownFileBytes, long estimatedFileBytes)
+    {
+        if (driveUsedBytes <= 0) return 0; long accounted = checked(Math.Max(0, knownFileBytes) + Math.Max(0, estimatedFileBytes)); return Math.Max(0, driveUsedBytes - accounted);
     }
 
     internal static string Classify(string path)
@@ -566,7 +567,7 @@ internal sealed class AnalyzerForm : Form
     {
         if (cancellation is not null) return; string current = NormalizeLocation(location.Text);
         if (resultsRoot is not null && NormalizeLocation(resultsRoot) == current) return;
-        cacheLoadCancellation?.Cancel(); Interlocked.Increment(ref cacheLoadGeneration); cacheLoading = false; SetCacheLoading(false); progress.Visible = false; allFiles.Clear(); resultsRoot = null; scannedAt = null; indexedBytesTotal = 0; categoryTotals.Clear(); ClearVisibleGrid(); deleteButton.Enabled = false; freshness.Text = "LOCATION CHANGED"; status.Text = "Location changed. Choose a valid folder, then load or run a scan."; UpdateDriveMetrics();
+        cacheLoadCancellation?.Cancel(); Interlocked.Increment(ref cacheLoadGeneration); cacheLoading = false; SetCacheLoading(false); progress.Visible = false; allFiles.Clear(); resultsRoot = null; scannedAt = null; indexedBytesTotal = estimatedBytesTotal = scanDriveUsedBytes = scanElapsedMilliseconds = 0; scanSkippedLocations = 0; categoryTotals.Clear(); ClearVisibleGrid(); deleteButton.Enabled = false; freshness.Text = "LOCATION CHANGED"; status.Text = "Location changed. Choose a valid folder, then load or run a scan."; UpdateDriveMetrics();
     }
     private async Task CheckForUpdatesAsync(bool interactive)
     {
@@ -618,9 +619,9 @@ internal sealed class AnalyzerForm : Form
     {
         _ = SaveCacheSnapshotAsync(snapshot, false);
     }
-    private void ClearVisibleGrid() { viewCancellation?.Cancel(); Interlocked.Increment(ref viewGeneration); visibleFiles = []; visibleTypes = []; visibleTypesBytes = 0; filesGrid.ClearSelection(); filesGrid.RowCount = 0; typesGrid.RowCount = 0; categoryList.Items.Clear(); }
-    private void SetCacheLoading(bool loading) { filesGrid.Enabled = !loading; categoryList.Enabled = !loading; categoryFilter.Enabled = !loading; mediaFilter.Enabled = !loading; search.Enabled = !loading; updateButton.Enabled = !loading && !updateBusy; deleteButton.Enabled = false; activityStrip.SetActive(loading || cancellation is not null); if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = !loading; }
-    private void SetScanning(bool scanning) { scanButton.Enabled = !scanning; stopButton.Enabled = scanning; deleteButton.Enabled = !scanning && allFiles.Count > 0; progress.Visible = scanning; categoryFilter.Enabled = !scanning; mediaFilter.Enabled = !scanning; categoryList.Enabled = !scanning; filesGrid.Enabled = !scanning; search.Enabled = !scanning; location.Enabled = !scanning; browseButton.Enabled = !scanning; updateButton.Enabled = !scanning && !updateBusy; activityStrip.SetActive(scanning || cacheLoading); if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = !scanning; }
+    private void ClearVisibleGrid() { viewCancellation?.Cancel(); Interlocked.Increment(ref viewGeneration); viewUpdating = false; visibleFiles = []; visibleTypes = []; visibleTypesBytes = 0; filesGrid.ClearSelection(); filesGrid.RowCount = 0; typesGrid.RowCount = 0; categoryList.Items.Clear(); }
+    private void SetCacheLoading(bool loading) { bool gridReady = !loading && !viewUpdating; filesGrid.Enabled = gridReady; categoryList.Enabled = !loading; categoryFilter.Enabled = !loading; mediaFilter.Enabled = !loading; search.Enabled = !loading; updateButton.Enabled = !loading && !updateBusy; deleteButton.Enabled = false; activityStrip.SetActive(loading || cancellation is not null); if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = gridReady; }
+    private void SetScanning(bool scanning) { bool gridReady = !scanning && !viewUpdating; scanButton.Enabled = !scanning; stopButton.Enabled = scanning; deleteButton.Enabled = gridReady && allFiles.Count > 0; progress.Visible = scanning; categoryFilter.Enabled = !scanning; mediaFilter.Enabled = !scanning; categoryList.Enabled = !scanning; filesGrid.Enabled = gridReady; search.Enabled = !scanning; location.Enabled = !scanning; browseButton.Enabled = !scanning; updateButton.Enabled = !scanning && !updateBusy; activityStrip.SetActive(scanning || cacheLoading); if (filesGrid.ContextMenuStrip is not null) filesGrid.ContextMenuStrip.Enabled = gridReady; }
     private void Browse() { using var dialog = new FolderBrowserDialog { Description = "Choose a drive or folder to scan", SelectedPath = location.Text, UseDescriptionForTitle = true, ShowNewFolderButton = false }; if (dialog.ShowDialog(this) == DialogResult.OK) { location.Text = dialog.SelectedPath; _ = LoadCachedAsync(dialog.SelectedPath); } }
     private static void ShowInExplorer(FileItem? file) { if (file is null || !File.Exists(file.Path)) return; System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", $"/select,\"{file.Path}\"") { UseShellExecute = true }); }
     private static string Age(DateTime value) { var age = DateTime.Now - value; return age.TotalMinutes < 2 ? "just now" : age.TotalHours < 1 ? $"{(int)age.TotalMinutes} min ago" : age.TotalDays < 1 ? $"{(int)age.TotalHours} hr ago" : value.ToString("g"); }
@@ -629,11 +630,26 @@ internal sealed class AnalyzerForm : Form
     private static ModernButton MakeButton(string text, Color back, Color fore) { var button = new ModernButton { Text = text, AutoSize = true, Margin = new Padding(5, 0, 0, 0) }; button.SetPalette(back, fore); return button; }
     private static DataGridView MakeGrid() => new SmoothDataGridView
     {
-        Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, AllowUserToResizeRows = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = true, RowHeadersVisible = false, BackgroundColor = Color.White, BorderStyle = BorderStyle.None,
-        CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal, GridColor = AppTheme.Border, EnableHeadersVisualStyles = false, ColumnHeadersHeight = 35, ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+        Dock = DockStyle.Fill,
+        ReadOnly = true,
+        AllowUserToAddRows = false,
+        AllowUserToDeleteRows = false,
+        AllowUserToResizeRows = false,
+        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+        MultiSelect = true,
+        RowHeadersVisible = false,
+        BackgroundColor = Color.White,
+        BorderStyle = BorderStyle.None,
+        CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+        GridColor = AppTheme.Border,
+        EnableHeadersVisualStyles = false,
+        ColumnHeadersHeight = 35,
+        ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
         ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.FromArgb(239, 244, 250), ForeColor = AppTheme.Text, Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold), SelectionBackColor = Color.FromArgb(239, 244, 250), SelectionForeColor = AppTheme.Text },
         DefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.White, ForeColor = AppTheme.Text, SelectionBackColor = Color.FromArgb(216, 236, 252), SelectionForeColor = Color.FromArgb(18, 43, 70), Padding = new Padding(3, 0, 3, 0) },
-        AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.FromArgb(249, 251, 253), SelectionBackColor = Color.FromArgb(216, 236, 252), SelectionForeColor = Color.FromArgb(18, 43, 70) }, RowTemplate = { Height = 30 }
+        AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.FromArgb(249, 251, 253), SelectionBackColor = Color.FromArgb(216, 236, 252), SelectionForeColor = Color.FromArgb(18, 43, 70) },
+        RowTemplate = { Height = 30 }
     };
     private static Label Metric() => new() { Text = "—", Dock = DockStyle.Fill, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 16.5f, FontStyle.Bold), ForeColor = AppTheme.Text, TextAlign = ContentAlignment.MiddleLeft };
     private static Label SmallLabel(string text) => new() { Text = text, Dock = DockStyle.Fill, AutoSize = true, Font = new Font("Segoe UI Semibold", 8f, FontStyle.Bold), ForeColor = AppTheme.Muted };
@@ -728,7 +744,8 @@ internal static class NativeDiskSize
 
 internal static class ScanCache
 {
-    private const int Version = 3;
+    private const int Version = 4;
+    private const int PreviousVersion = 3;
     private static readonly object Sync = new();
     private static string DirectoryName => Environment.GetEnvironmentVariable("SPACELENS_CACHE_DIR") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens");
     private static string LastPath => Path.Combine(DirectoryName, "last-location.txt");
@@ -746,7 +763,8 @@ internal static class ScanCache
             using (var writer = new BinaryWriter(gzip, Encoding.UTF8))
             {
                 uint rootVolume = NativeFileIdentity.TryGet(storedRoot, true, out var rootIdentity) ? rootIdentity.Id.VolumeSerial : 0;
-                writer.Write(Version); writer.Write(storedRoot); writer.Write(rootVolume); writer.Write(snapshot.ScannedAt.ToBinary()); writer.Write(snapshot.Files.Count);
+                if (snapshot.Summary.DriveUsedBytes < 0 || snapshot.Summary.SkippedLocations < 0 || snapshot.Summary.ElapsedMilliseconds < 0) throw new InvalidDataException("Scan contains invalid summary information.");
+                writer.Write(Version); writer.Write(storedRoot); writer.Write(rootVolume); writer.Write(snapshot.ScannedAt.ToBinary()); writer.Write(snapshot.Summary.DriveUsedBytes); writer.Write(snapshot.Summary.SkippedLocations); writer.Write(snapshot.Summary.ElapsedMilliseconds); writer.Write(snapshot.Files.Count);
                 foreach (var item in snapshot.Files)
                 {
                     if (item.DiskBytes < 0 || item.LogicalBytes < 0 || item.Path.Length > 32767 || item.Category.Length > 256 || !IsUnderRoot(item.Path, storedRoot)) throw new InvalidDataException("Scan contains an invalid file record.");
@@ -762,9 +780,11 @@ internal static class ScanCache
     {
         string path = CachePath(root); if (!File.Exists(path)) return null;
         using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 1024 * 1024); using var gzip = new GZipStream(file, CompressionMode.Decompress); using var reader = new BinaryReader(gzip, Encoding.UTF8);
-        if (reader.ReadInt32() != Version) return null; string storedRoot = Path.GetFullPath(reader.ReadString()); if (!storedRoot.Equals(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) return null;
+        int version = reader.ReadInt32(); if (version is not (Version or PreviousVersion)) return null; string storedRoot = Path.GetFullPath(reader.ReadString()); if (!storedRoot.Equals(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) return null;
         uint storedVolume = reader.ReadUInt32(); if (storedVolume != 0 && (!NativeFileIdentity.TryGet(storedRoot, true, out var currentRoot) || currentRoot.Id.VolumeSerial != storedVolume)) return null;
         DateTime scanned = DateTime.FromBinary(reader.ReadInt64()); if (scanned < new DateTime(2000, 1, 1) || scanned > DateTime.Now.AddDays(1)) throw new InvalidDataException("Saved scan contains an invalid timestamp.");
+        ScanSummary summary = version == Version ? new(reader.ReadInt64(), reader.ReadInt32(), reader.ReadInt64()) : default;
+        if (summary.DriveUsedBytes < 0 || summary.SkippedLocations < 0 || summary.ElapsedMilliseconds < 0) throw new InvalidDataException("Saved scan contains invalid summary information.");
         int count = reader.ReadInt32(); if (count < 0 || count > 5_000_000) throw new InvalidDataException("Saved scan contains an invalid file count.");
         long totalDisk = 0, totalLogical = 0; var files = new List<FileItem>(count);
         for (int i = 0; i < count; i++)
@@ -773,7 +793,7 @@ internal static class ScanCache
             if (itemPath.Length > 32767 || category.Length > 256 || disk < 0 || logical < 0 || !IsUnderRoot(itemPath, storedRoot) || (volumeSerial != 0 && fileIndex == 0)) throw new InvalidDataException("Saved scan contains an invalid record.");
             totalDisk = checked(totalDisk + disk); totalLogical = checked(totalLogical + logical); files.Add(new(Path.GetFullPath(itemPath), disk, logical, modified, category, created, estimated, volumeSerial, fileIndex));
         }
-        return new(storedRoot, scanned, files);
+        return new(storedRoot, scanned, files, summary);
     }
 
     private static bool IsUnderRoot(string path, string root)
@@ -795,6 +815,7 @@ internal static class SelfTest
         try
         {
             if (!ByteFormatter.Validate()) return Fail("Decimal byte formatting failed");
+            var scannerRegression = ScannerRegressionTests.Run(); if (!scannerRegression.Passed) return Fail(scannerRegression.Failure!);
             Directory.CreateDirectory(Path.Combine(root, "Downloads")); string file = Path.Combine(root, "Downloads", "sample.bin"); File.WriteAllBytes(file, new byte[4096]);
             string hardLinkSource = Path.Combine(root, "hard-link-source.bin"), hardLinkAlias = Path.Combine(root, "hard-link-alias.bin"); File.WriteAllBytes(hardLinkSource, new byte[8192]); bool hardLinksSupported = CreateHardLinkW(hardLinkAlias, hardLinkSource, IntPtr.Zero);
             string longDirectory = root; while (longDirectory.Length < 285) longDirectory = Path.Combine(longDirectory, "long-path-segment"); Directory.CreateDirectory(longDirectory); string longFile = Path.Combine(longDirectory, "long-file.bin"); File.WriteAllBytes(longFile, new byte[128]);
@@ -828,12 +849,15 @@ internal static class SelfTest
             var timer = System.Diagnostics.Stopwatch.StartNew(); var view = AnalyzerForm.BuildView(many, "Downloads", "All types", "", "DiskSize", false, true, CancellationToken.None); timer.Stop();
             if (view.FilteredCount != 100_000 || view.VisibleFiles.Count != 10_000 || view.VisibleFiles[0].DiskBytes != 199_999 || view.VisibleFiles[^1].DiskBytes != 180_001 || view.VisibleFiles.Any(item => item.Category != "Downloads") || view.Categories is null || timer.Elapsed > TimeSpan.FromSeconds(5)) return Fail($"View performance/filter test failed ({timer.ElapsedMilliseconds} ms)");
             var estimate = new FileItem(Path.Combine(root, "estimated.bin"), 50_000, 50_000, DateTime.Now, "Other", AllocationEstimated: true); var estimatedView = AnalyzerForm.BuildView([new FileItem(file, 4096, 4096, DateTime.Now, "Downloads"), estimate], "All files", "All types", "", "DiskSize", false, true, CancellationToken.None);
-            if (estimatedView.IndexedBytes != 4096 || estimatedView.FilteredBytes != 4096 || estimatedView.EstimatedAllocationCount != 1 || estimatedView.FilteredEstimatedAllocationCount != 1) return Fail("Estimated allocation accounting failed");
+            if (estimatedView.IndexedBytes != 4096 || estimatedView.FilteredBytes != 4096 || estimatedView.EstimatedAllocationBytes != 50_000 || estimatedView.FilteredEstimatedBytes != 50_000 || estimatedView.EstimatedAllocationCount != 1 || estimatedView.FilteredEstimatedAllocationCount != 1 || estimatedView.Categories?["Other"].Bytes != 50_000 || estimatedView.Types.Single(type => type.Extension == ".bin").Bytes != 54_096) return Fail("Estimated allocation accounting failed");
+            if (AnalyzerForm.CalculateProtectedBytes(386_301_222_912, 310_727_223_365, 44_316_729_344) != 31_257_270_203) return Fail("Protected/system storage accounting failed");
             using (var canceled = new CancellationTokenSource()) { canceled.Cancel(); try { AnalyzerForm.BuildView(many, "All files", "All types", "", "DiskSize", false, true, canceled.Token); return Fail("View cancellation failed"); } catch (OperationCanceledException) { } }
             if (!AnalyzerForm.IsSensitivePath(system)) return Fail("Sensitive path protection failed");
             Environment.SetEnvironmentVariable("SPACELENS_CACHE_DIR", Path.Combine(root, "cache"));
-            NativeFileIdentity.TryGet(file, false, out var cachedIdentity); var item = new FileItem(file, 4096, 4096, File.GetLastWriteTime(file), "Downloads", File.GetCreationTime(file), false, cachedIdentity.Id.VolumeSerial, cachedIdentity.Id.FileIndex); var snapshot = new ScanSnapshot(root, DateTime.Now, [item]); ScanCache.Save(snapshot); var loaded = ScanCache.Load(root);
-            if (loaded is null || loaded.Files.Count != 1 || loaded.Files[0].Path != file || loaded.Files[0].DiskBytes != 4096 || loaded.Files[0].Created != item.Created || loaded.Files[0].FileIndex != item.FileIndex) return Fail("Cache round-trip failed");
+            NativeFileIdentity.TryGet(file, false, out var cachedIdentity); var item = new FileItem(file, 4096, 4096, File.GetLastWriteTime(file), "Downloads", File.GetCreationTime(file), false, cachedIdentity.Id.VolumeSerial, cachedIdentity.Id.FileIndex); var snapshot = new ScanSnapshot(root, DateTime.Now, [item], new ScanSummary(123_456, 7, 890)); ScanCache.Save(snapshot); var loaded = ScanCache.Load(root);
+            if (loaded is null || loaded.Files.Count != 1 || loaded.Files[0].Path != file || loaded.Files[0].DiskBytes != 4096 || loaded.Files[0].Created != item.Created || loaded.Files[0].FileIndex != item.FileIndex || loaded.Summary != snapshot.Summary) return Fail("Cache round-trip failed");
+            string legacyCachePath = Directory.GetFiles(Path.Combine(root, "cache"), "scan-*.slc").Single(); WriteLegacyV3Cache(legacyCachePath, snapshot); var legacyLoaded = ScanCache.Load(root);
+            if (legacyLoaded is null || legacyLoaded.Files.Count != 1 || legacyLoaded.Files[0].Path != file || legacyLoaded.Summary != default) return Fail("Legacy v3 cache compatibility failed");
             using (var canceled = new CancellationTokenSource()) { canceled.Cancel(); try { ScanCache.Load(root, canceled.Token); return Fail("Cache cancellation failed"); } catch (OperationCanceledException) { } }
             if (!Path.GetFullPath(InstallerLifecycle.InstallDirectory).StartsWith(Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)), StringComparison.OrdinalIgnoreCase)) return Fail("Installer path validation failed");
             using (var form = new AnalyzerForm()) { if (form.Handle == IntPtr.Zero) return Fail("UI construction failed"); }
@@ -843,6 +867,13 @@ internal static class SelfTest
         finally { try { Directory.Delete(root, true); } catch { } }
     }
     private static bool Fail(string message) { try { var path = Environment.GetEnvironmentVariable("SPACELENS_SELFTEST_LOG"); if (!string.IsNullOrEmpty(path)) File.WriteAllText(path, message); } catch { } return false; }
+    private static void WriteLegacyV3Cache(string cachePath, ScanSnapshot snapshot)
+    {
+        using var file = new FileStream(cachePath, FileMode.Create, FileAccess.Write, FileShare.None); using var gzip = new GZipStream(file, CompressionLevel.Fastest); using var writer = new BinaryWriter(gzip, Encoding.UTF8);
+        uint rootVolume = NativeFileIdentity.TryGet(snapshot.Root, true, out var rootIdentity) ? rootIdentity.Id.VolumeSerial : 0;
+        writer.Write(3); writer.Write(Path.GetFullPath(snapshot.Root)); writer.Write(rootVolume); writer.Write(snapshot.ScannedAt.ToBinary()); writer.Write(snapshot.Files.Count);
+        foreach (FileItem item in snapshot.Files) { writer.Write(Path.GetFullPath(item.Path)); writer.Write(item.DiskBytes); writer.Write(item.LogicalBytes); writer.Write(item.Modified.ToBinary()); writer.Write(item.Category); writer.Write(item.Created.ToBinary()); writer.Write(item.AllocationEstimated); writer.Write(item.VolumeSerial); writer.Write(item.FileIndex); }
+    }
     private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T> { public void Report(T value) => report(value); }
     private static bool MakeSparse(Microsoft.Win32.SafeHandles.SafeFileHandle handle) { try { return DeviceIoControl(handle, 0x000900C4, IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero); } catch { return false; } }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool CreateHardLinkW(string fileName, string existingFileName, IntPtr securityAttributes);
