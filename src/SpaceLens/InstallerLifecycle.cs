@@ -44,8 +44,8 @@ internal static class InstallerLifecycle
             string expected = Path.GetFullPath(InstallDirectory).TrimEnd(Path.DirectorySeparatorChar); string executable = Path.GetFullPath(InstalledExecutable);
             if (!executable.StartsWith(expected + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("The install path failed safety validation.");
             TryDeleteFile(DesktopShortcut); TryDeleteFile(StartMenuShortcut); TryDeleteDirectoryIfEmpty(StartMenuDirectory);
-            using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall", true)) key?.DeleteSubKeyTree("SpaceLens", false);
             DeleteValidatedDirectory(expected, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "SpaceLens"));
+            using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall", true)) key?.DeleteSubKeyTree("SpaceLens", false);
             if (removeCache) DeleteValidatedDirectory(CacheDirectory, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens"));
             if (!quiet) MessageBox.Show("SpaceLens was removed successfully.", "Uninstall complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }

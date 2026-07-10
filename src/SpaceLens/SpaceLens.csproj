@@ -9,8 +9,6 @@
     <RootNamespace>DesktopOrganizer</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>assets\spacelens.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
     <Product>SpaceLens</Product>
     <Company>SpaceLens</Company>
     <Description>Fast, friendly Windows disk space analyzer</Description>

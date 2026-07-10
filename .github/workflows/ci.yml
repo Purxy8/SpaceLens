@@ -17,9 +17,8 @@ jobs:
       - name: Install .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 10.0.301
 
       - name: Build packages and run packaged self-tests
         shell: pwsh
-        run: .\scripts\Build-Release.ps1 -Version 1.1.0
-
+        run: .\scripts\Build-Release.ps1

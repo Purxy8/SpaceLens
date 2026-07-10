@@ -38,7 +38,7 @@ internal readonly record struct SemanticVersion(int Major, int Minor, int Patch)
 
 internal static class UpdateService
 {
-    internal const string CurrentVersionText = "1.1.0";
+    internal static string CurrentVersionText { get; } = ResolveCurrentVersion();
     private const string Repository = "Purxy8/SpaceLens";
     private const string AssetName = "SpaceLens-Setup.exe";
     private const string FeedUrl = "https://github.com/Purxy8/SpaceLens/releases/latest/download/update.json";
@@ -46,6 +46,14 @@ internal static class UpdateService
     private const long MaximumInstallerBytes = 250L * 1024 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
     private static string StatePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-state.json");
+
+    private static string ResolveCurrentVersion()
+    {
+        Version? version = Assembly.GetExecutingAssembly().GetName().Version;
+        string value = version is null ? "" : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
+        if (!SemanticVersion.TryParse(value, out _)) throw new InvalidOperationException("The installed application version is invalid.");
+        return value;
+    }
 
     internal static bool AutomaticCheckIsDue()
     {
@@ -121,6 +129,18 @@ internal static class UpdateService
         using var stream = File.OpenRead(path); byte[] expected = Convert.FromHexString(manifest.Sha256), actual = SHA256.HashData(stream); if (!CryptographicOperations.FixedTimeEquals(expected, actual)) throw new CryptographicException("The installer hash does not match the signed release manifest.");
     }
 
+    internal static int VerifyRelease(string manifestPath, string installerPath)
+    {
+        try
+        {
+            byte[] json = File.ReadAllBytes(manifestPath); if (json.Length > 65536) throw new InvalidDataException("The update manifest is too large.");
+            UpdateManifest manifest = ParseAndValidate(json);
+            if (!manifest.Version.Equals(CurrentVersionText, StringComparison.Ordinal)) throw new InvalidDataException($"The manifest version {manifest.Version} does not match SpaceLens {CurrentVersionText}.");
+            VerifyInstallerFile(installerPath, manifest); return 0;
+        }
+        catch { return 1; }
+    }
+
     private static HttpClient CreateClient()
     {
         var handler = new HttpClientHandler { AllowAutoRedirect = true, MaxAutomaticRedirections = 5, CheckCertificateRevocationList = true, AutomaticDecompression = DecompressionMethods.None }; var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) }; client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("SpaceLens", CurrentVersionText)); return client;
@@ -143,5 +163,5 @@ internal sealed class UpdateProgressForm : Form
         Controls.Add(cancel); Controls.Add(bar); Controls.Add(message);
     }
     internal void MarkComplete() => complete = true;
-    private static string Format(long bytes) => $"{bytes / 1024d / 1024d:0.0} MiB";
+    private static string Format(long bytes) => ByteFormatter.Format(bytes);
 }

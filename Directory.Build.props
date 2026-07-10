@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <SpaceLensVersion>1.2.0</SpaceLensVersion>
+    <Version>$(SpaceLensVersion)</Version>
+    <FileVersion>$(SpaceLensVersion).0</FileVersion>
+    <InformationalVersion>$(SpaceLensVersion)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Release' or '$(CI)' == 'true'">true</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>

@@ -9,12 +9,10 @@
     <RootNamespace>SpaceLensSetup</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>..\SpaceLens\assets\spacelens.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
     <Product>SpaceLens Setup</Product>
     <Company>SpaceLens</Company>
     <Description>Installer for SpaceLens disk space analyzer</Description>
-    <SpaceLensPayload Condition="'$(SpaceLensPayload)' == ''">..\..\artifacts\SpaceLens.exe</SpaceLensPayload>
+    <SpaceLensPayload Condition="'$(SpaceLensPayload)' == ''">..\..\artifacts\release\$(SpaceLensVersion)\SpaceLens.exe</SpaceLensPayload>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="$(SpaceLensPayload)" LogicalName="SpaceLens.Payload.exe" />
