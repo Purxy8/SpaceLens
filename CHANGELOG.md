@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0 — 2026-07-11
+
+- Added an optional full-access Administrator scan that keeps the UI unelevated, enables only Windows backup privilege in a short-lived authenticated helper, and preserves the fast buffered scanner.
+- Preserved scan-time file attributes and added explicit Normal, Important, and Protected safety levels with a dedicated filter, visible safety notes, row styling, and per-file explanations.
+- Added typed confirmation for protected Windows/system files while keeping Recycle Bin-only removal and allowing Windows to remain the final permission barrier.
+- Replaced the legacy delete wrapper with Windows `IFileOperation` and `FOFX_RECYCLEONDELETE`, so cleanup fails safely when recycling is unavailable instead of silently falling back to permanent deletion.
+- Fixed access-denied protected files being mistaken for missing files and silently removed from saved results.
+- Fixed recycled allocations being incorrectly persisted as increased System / protected storage; drive accounting now requests a rescan after mutations.
+- Added before/after drive-usage reconciliation notes, v5 saved-scan metadata with v4/v3 compatibility, a single-instance guard, and matching cache/protocol record limits.
+- Expanded regression coverage for safety classification, protected filtering, native state validation, explicit confirmation, full-access metadata, and cache migration.
+
 ## 1.3.0 — 2026-07-10
 
 - Replaced per-file handle probing with buffered Windows directory metadata scanning, dramatically improving scan throughput while retaining allocation size, timestamps, stable file IDs, sparse-file accounting, and hard-link deduplication.

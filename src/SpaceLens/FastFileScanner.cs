@@ -12,6 +12,24 @@ namespace DesktopOrganizer;
 internal static class FastFileScanner
 {
     private const int ReportBatchSize = 8_000;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint CloudTagMask = 0xFFFF0FFF;
+    private const uint CloudTagBase = 0x9000001A;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileAttributeTagInformation
+    {
+        internal FileAttributes FileAttributes;
+        internal uint ReparseTag;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, FileShare shareMode, IntPtr securityAttributes, FileMode creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int informationClass, out FileAttributeTagInformation information, uint bufferSize);
 
     internal static bool ProbeNativeEnumeration(string directory)
     {
@@ -23,7 +41,7 @@ internal static class FastFileScanner
         catch { return false; }
     }
 
-    internal static int Scan(string root, IProgress<(List<FileItem>, int)> progress, CancellationToken token)
+    internal static int Scan(string root, IProgress<(List<FileItem>, int)> progress, CancellationToken token, bool strictReparseDirectories = false)
     {
         ArgumentNullException.ThrowIfNull(progress);
 
@@ -55,11 +73,11 @@ internal static class FastFileScanner
             NativeEnumerationResult result = native.Enumerate(
                 directory,
                 token,
-                entry => ProcessNativeEntry(directory, entry, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress));
+                entry => ProcessNativeEntry(directory, entry, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, strictReparseDirectories));
 
             if (result == NativeEnumerationResult.UnsupportedBeforeFirstEntry)
             {
-                EnumerateManaged(directory, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, token);
+                EnumerateManaged(directory, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, token, strictReparseDirectories);
             }
             else if (result == NativeEnumerationResult.Failed)
             {
@@ -82,7 +100,8 @@ internal static class FastFileScanner
         HashSet<NativeFileId> countedFiles,
         List<FileItem> batch,
         ref int skipped,
-        IProgress<(List<FileItem>, int)> progress)
+        IProgress<(List<FileItem>, int)> progress,
+        bool strictReparseDirectories)
     {
         string path;
         try
@@ -98,7 +117,7 @@ internal static class FastFileScanner
 
         if (isDirectory)
         {
-            if (isReparsePoint && IsDirectoryLink(path)) { skipped++; return; }
+            if (isReparsePoint && (strictReparseDirectories ? !IsCloudDirectory(path) : IsDirectoryLink(path))) { skipped++; return; }
             if (id.FileIndex != 0 && !visitedDirectories.Add(id)) { skipped++; return; }
             pending.Push(path);
             return;
@@ -110,16 +129,19 @@ internal static class FastFileScanner
 
         try
         {
+            string category = AnalyzerForm.Classify(path);
             FileItem item = new(
                 path,
                 entry.AllocationSize,
                 entry.EndOfFile,
                 ToLocalFileTime(entry.LastWriteTime),
-                AnalyzerForm.Classify(path),
+                category,
                 ToLocalFileTime(entry.CreationTime),
                 AllocationEstimated: false,
                 id.VolumeSerial,
-                id.FileIndex);
+                id.FileIndex,
+                entry.Attributes,
+                AnalyzerForm.ClassifySafety(path, category, entry.Attributes));
             if (id.FileIndex != 0 && !countedFiles.Add(id)) item = item with { DiskBytes = 0 };
             batch.Add(item);
             FlushIfFull(batch, skipped, progress);
@@ -139,7 +161,8 @@ internal static class FastFileScanner
         List<FileItem> batch,
         ref int skipped,
         IProgress<(List<FileItem>, int)> progress,
-        CancellationToken token)
+        CancellationToken token,
+        bool strictReparseDirectories)
     {
         try
         {
@@ -150,7 +173,7 @@ internal static class FastFileScanner
                 {
                     var info = new DirectoryInfo(child);
                     bool reparse = (info.Attributes & FileAttributes.ReparsePoint) != 0;
-                    if (reparse && info.LinkTarget is not null) { skipped++; continue; }
+                    if (reparse && (strictReparseDirectories ? !IsCloudDirectory(child) : info.LinkTarget is not null)) { skipped++; continue; }
                     if (NativeFileIdentity.TryGet(child, true, out var identity))
                     {
                         if ((rootVolume != 0 && identity.Id.VolumeSerial != rootVolume) || !visitedDirectories.Add(identity.Id)) { skipped++; continue; }
@@ -187,7 +210,8 @@ internal static class FastFileScanner
                         volumeSerial = identity.Id.VolumeSerial;
                         fileIndex = identity.Id.FileIndex;
                     }
-                    FileItem item = new(path, allocated, logical, info.LastWriteTime, AnalyzerForm.Classify(path), info.CreationTime, estimated, volumeSerial, fileIndex);
+                    string category = AnalyzerForm.Classify(path);
+                    FileItem item = new(path, allocated, logical, info.LastWriteTime, category, info.CreationTime, estimated, volumeSerial, fileIndex, attributes, AnalyzerForm.ClassifySafety(path, category, attributes));
                     if (hasIdentity && !countedFiles.Add(identity.Id)) item = item with { DiskBytes = 0, AllocationEstimated = false };
                     batch.Add(item);
                 }
@@ -202,6 +226,17 @@ internal static class FastFileScanner
     {
         try { return new DirectoryInfo(path).LinkTarget is not null; }
         catch { return true; }
+    }
+
+    private static bool IsCloudDirectory(string path)
+    {
+        try
+        {
+            using SafeFileHandle handle = CreateFileW(NativePath.For(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (handle.IsInvalid || !GetFileInformationByHandleEx(handle, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())) return false;
+            return (information.ReparseTag & CloudTagMask) == CloudTagBase;
+        }
+        catch { return false; }
     }
 
     private static bool IsFileLink(string path)
