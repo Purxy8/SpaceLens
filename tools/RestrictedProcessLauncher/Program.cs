@@ -18,6 +18,7 @@ internal static class RestrictedProcessLauncher
     private const int TokenElevationType = 18;
     private const int TokenElevation = 20;
     private const int TokenHasRestrictions = 21;
+    private const int TokenElevationTypeDefault = 1;
     private const int TokenElevationTypeLimited = 3;
     private const int SecurityImpersonation = 2;
     private const int TokenTypeImpersonation = 2;
@@ -216,8 +217,9 @@ internal static class RestrictedProcessLauncher
     private static void VerifyRestrictedNonAdministrator(SafeAccessTokenHandle token, string description)
     {
         if (GetTokenElevation(token) != 0) throw new SecurityException($"The {description} is still elevated.");
-        if (GetTokenInt32(token, TokenElevationType, "TokenElevationType") != TokenElevationTypeLimited)
-            throw new SecurityException($"The {description} is not a Windows limited token.");
+        int elevationType = GetTokenInt32(token, TokenElevationType, "TokenElevationType");
+        if (elevationType is not TokenElevationTypeDefault and not TokenElevationTypeLimited)
+            throw new SecurityException($"The {description} reports an unsafe or unknown elevation type ({elevationType}).");
         if (GetTokenInt32(token, TokenHasRestrictions, "TokenHasRestrictions") == 0)
             throw new SecurityException($"The {description} does not report token restrictions.");
         if (IsAdministrator(token)) throw new SecurityException($"The {description} still has enabled Administrators membership.");

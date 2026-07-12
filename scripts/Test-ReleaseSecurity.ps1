@@ -338,7 +338,7 @@ try {
     $launcherSource = Get-Content -Raw -LiteralPath (Join-Path $repository 'tools\RestrictedProcessLauncher\Program.cs')
     foreach ($launcherControl in @(
         'CreateRestrictedToken', 'DisableMaxPrivilege | LuaToken', 'TokenAssignPrimary | TokenDuplicate | TokenQuery', 'CreateSuspended',
-        'OpenProcessToken(process.Process, TokenDuplicate | TokenQuery', 'GetTokenElevation', 'TokenElevationTypeLimited', 'TokenHasRestrictions',
+        'OpenProcessToken(process.Process, TokenDuplicate | TokenQuery', 'GetTokenElevation', 'TokenElevationTypeDefault', 'TokenElevationTypeLimited', 'TokenHasRestrictions',
         'DuplicateTokenEx', 'CheckTokenMembership(impersonationToken',
         'AssignProcessToJobObject', 'JobObjectLimitKillOnJobClose', 'TerminateJobObject', 'ResumeThread',
         'BuildSanitizedEnvironmentBlock', 'COREHOST_', 'APP_CONTEXT_', 'NATIVE_DLL_SEARCH_DIRECTORIES',
