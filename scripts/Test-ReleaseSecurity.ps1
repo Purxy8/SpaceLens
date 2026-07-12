@@ -329,6 +329,13 @@ try {
     foreach ($targetControl in @('Assert-TrackedTrustAssets', 'Assert-ReleasePathHasNoReparsePoints', 'Compare-Object')) {
         if ($rotationScript -notmatch [regex]::Escape($targetControl)) { throw "Trust-rotation handoff lacks target ancestry/set validation $targetControl." }
     }
+    $releaseSecurityModule = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'ReleaseSecurity.psm1')
+    $lockedLaunchBoundary = $releaseSecurityModule.IndexOf('function Invoke-LockedReleaseSigner', [StringComparison]::Ordinal)
+    if ($lockedLaunchBoundary -lt 0) { throw 'Release security module is missing the locked signer launch boundary.' }
+    $lockedLaunchSource = $releaseSecurityModule.Substring($lockedLaunchBoundary)
+    if ($lockedLaunchSource -notmatch '(?m)^\s*&\s+\$Lock\.FullPath\s+@Arguments\s*$' -or $lockedLaunchSource -match '(?im)Start-Process|cmd\.exe|powershell') {
+        throw 'Locked ReleaseSigner must use the exact executable path and array arguments without a shell or Start-Process.'
+    }
 
     $launcherProject = Get-Content -Raw -LiteralPath (Join-Path $repository 'tools\RestrictedProcessLauncher\RestrictedProcessLauncher.csproj')
     if ($launcherProject -notmatch '<SelfContained>false</SelfContained>' -or

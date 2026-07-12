@@ -323,9 +323,12 @@ function Invoke-LockedReleaseSigner {
         [Environment]::SetEnvironmentVariable($name, '0', [EnvironmentVariableTarget]::Process)
     }
     try {
-        $argumentLine = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
-        $process = Start-Process -FilePath $Lock.FullPath -ArgumentList $argumentLine -PassThru -Wait
-        try { $exitCode = $process.ExitCode } finally { $process.Dispose() }
+        # The call operator launches the exact locked path without a shell and
+        # preserves argument boundaries. It also avoids a process-cmdlet
+        # framework bug when an inherited environment contains case-duplicate
+        # names such as Path/PATH.
+        & $Lock.FullPath @Arguments
+        $exitCode = $LASTEXITCODE
     }
     finally {
         foreach ($entry in $saved.GetEnumerator()) {
