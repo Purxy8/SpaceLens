@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace SpaceLensSetup;
@@ -21,6 +23,8 @@ internal sealed class SetupForm : Form
 {
     private readonly CheckBox desktopShortcut = new() { Text = "Create a Desktop shortcut", Checked = true, AutoSize = true };
     private readonly CheckBox launchAfter = new() { Text = "Launch SpaceLens after installation", Checked = true, AutoSize = true };
+    private readonly CheckBox automaticUpdates = new() { Text = "Check for updates automatically (contacts GitHub at most once per day)", Checked = true, AutoSize = true };
+    private readonly LinkLabel privacyPolicy = new() { Text = "Privacy information", AutoSize = true, LinkColor = Color.FromArgb(0, 102, 184) };
     private readonly Button installButton = new() { Text = "Install", Size = new Size(112, 38), BackColor = Color.FromArgb(0, 120, 215), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
     private readonly Button cancelButton = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(96, 38) };
     private readonly ProgressBar progress = new() { Style = ProgressBarStyle.Marquee, Visible = false };
@@ -29,34 +33,40 @@ internal sealed class SetupForm : Form
 
     internal SetupForm(bool upgrade = false)
     {
-        Text = upgrade ? "Update SpaceLens" : "Install SpaceLens"; ClientSize = new Size(590, 410); FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 10); BackColor = Color.FromArgb(246, 248, 251);
+        Text = upgrade ? "Update SpaceLens" : "Install SpaceLens"; ClientSize = new Size(590, 472); FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 10); BackColor = Color.FromArgb(246, 248, 251);
         if (upgrade) desktopShortcut.Checked = SetupEngine.HasDesktopShortcut;
+        automaticUpdates.Checked = SetupEngine.AutomaticUpdateChecksEnabled;
         var header = new Panel { Dock = DockStyle.Top, Height = 108, BackColor = Color.FromArgb(25, 33, 48) };
         header.Controls.Add(new Label { Text = "SpaceLens", Font = new Font("Segoe UI", 25, FontStyle.Bold), ForeColor = Color.White, AutoSize = true, Location = new Point(28, 20) });
         header.Controls.Add(new Label { Text = "Fast, friendly disk space analysis", ForeColor = Color.FromArgb(180, 195, 215), AutoSize = true, Location = new Point(31, 68) });
         var title = new Label { Text = upgrade ? $"Update SpaceLens to version {SetupEngine.SetupVersionText}" : "Install SpaceLens for this Windows account", Font = new Font("Segoe UI", 15, FontStyle.Bold), AutoSize = true, Location = new Point(30, 137) };
         var description = new Label { Text = upgrade ? "Your saved scans and preferences will be preserved.\nSpaceLens will replace only its installed application files." : "Setup creates a Start Menu entry, an Apps & Features uninstall entry,\nand—if selected—a Desktop shortcut. Administrator access is not required.", AutoSize = true, ForeColor = Color.FromArgb(70, 80, 95), Location = new Point(32, 177) };
         var path = new Label { Text = SetupEngine.InstallDirectory, AutoEllipsis = true, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Location = new Point(32, 229), Size = new Size(524, 29), Padding = new Padding(6, 4, 6, 4) };
-        desktopShortcut.Location = new Point(33, 277); launchAfter.Location = new Point(33, 307);
-        progress.Location = new Point(32, 347); progress.Size = new Size(280, 22); state.Location = new Point(32, 378);
-        cancelButton.Location = new Point(348, 340); installButton.Text = upgrade ? "Update" : "Install"; installButton.Location = new Point(450, 340); installButton.Click += async (_, _) => await InstallAsync();
+        desktopShortcut.Location = new Point(33, 274); launchAfter.Location = new Point(33, 304); automaticUpdates.Location = new Point(33, 334); privacyPolicy.Location = new Point(34, 368);
+        privacyPolicy.LinkClicked += (_, _) =>
+        {
+            try { Process.Start(new ProcessStartInfo(SetupEngine.PrivacyPage) { UseShellExecute = true }); }
+            catch (Exception ex) { MessageBox.Show(this, $"Setup could not open the privacy page.\n\n{ex.Message}", "Could not open link", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        };
+        progress.Location = new Point(32, 410); progress.Size = new Size(280, 22); state.Location = new Point(32, 442);
+        cancelButton.Location = new Point(348, 403); installButton.Text = upgrade ? "Update" : "Install"; installButton.Location = new Point(450, 403); installButton.Click += async (_, _) => await InstallAsync();
         FormClosing += (_, e) => { if (installing) e.Cancel = true; };
-        Controls.AddRange([header, title, description, path, desktopShortcut, launchAfter, progress, state, cancelButton, installButton]); CancelButton = cancelButton; AcceptButton = installButton;
+        Controls.AddRange([header, title, description, path, desktopShortcut, launchAfter, automaticUpdates, privacyPolicy, progress, state, cancelButton, installButton]); CancelButton = cancelButton; AcceptButton = installButton;
     }
 
     private async Task InstallAsync()
     {
-        bool createDesktopShortcut = desktopShortcut.Checked; installing = true; installButton.Enabled = false; cancelButton.Enabled = false; desktopShortcut.Enabled = false; launchAfter.Enabled = false; progress.Visible = true; state.Text = "Verifying and installing SpaceLens…"; bool completed = false;
+        bool createDesktopShortcut = desktopShortcut.Checked, enableAutomaticUpdates = automaticUpdates.Checked; installing = true; installButton.Enabled = false; cancelButton.Enabled = false; desktopShortcut.Enabled = false; launchAfter.Enabled = false; automaticUpdates.Enabled = false; privacyPolicy.Enabled = false; progress.Visible = true; state.Text = "Verifying and installing SpaceLens…"; bool completed = false;
         try
         {
-            await Task.Run(() => SetupEngine.Install(createDesktopShortcut)); state.Text = "Installation complete.";
+            await Task.Run(() => SetupEngine.Install(createDesktopShortcut, enableAutomaticUpdates)); state.Text = "Installation complete.";
             completed = true;
             if (launchAfter.Checked) try { Process.Start(new ProcessStartInfo(SetupEngine.InstalledExecutable) { UseShellExecute = true }); } catch (Exception ex) { MessageBox.Show(this, $"SpaceLens was installed, but Windows could not launch it.\n\n{ex.Message}", "Installed successfully", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
         catch (Exception ex) { state.Text = "Installation failed."; MessageBox.Show(this, ex.Message, "Could not install SpaceLens", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         finally
         {
-            installing = false; progress.Visible = false; cancelButton.Enabled = true; desktopShortcut.Enabled = true; launchAfter.Enabled = true; if (!completed) installButton.Enabled = true;
+            installing = false; progress.Visible = false; cancelButton.Enabled = true; desktopShortcut.Enabled = true; launchAfter.Enabled = true; automaticUpdates.Enabled = true; privacyPolicy.Enabled = true; if (!completed) installButton.Enabled = true;
         }
         if (completed) { MessageBox.Show(this, "SpaceLens is installed and ready to use.", "Installation complete", MessageBoxButtons.OK, MessageBoxIcon.Information); Close(); }
     }
@@ -69,13 +79,17 @@ internal static class SetupEngine
     internal static string SetupVersionText => SetupVersion.ToString(3);
     internal static string InstallDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "SpaceLens");
     internal static string InstalledExecutable => Path.Combine(InstallDirectory, "SpaceLens.exe");
+    internal const string PrivacyPage = "https://github.com/Purxy8/SpaceLens/blob/main/PRIVACY.md";
+    private static string UpdateStatePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-state.json");
+    private static readonly JsonSerializerOptions UpdateStateJsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false };
     private static string DesktopShortcut => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SpaceLens.lnk");
     private static string StartMenuDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SpaceLens");
     private static string StartMenuShortcut => Path.Combine(StartMenuDirectory, "SpaceLens.lnk");
     private const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\SpaceLens";
     internal static bool HasDesktopShortcut => File.Exists(DesktopShortcut);
+    internal static bool AutomaticUpdateChecksEnabled => ReadAutomaticUpdatePreference();
 
-    internal static void Install(bool createDesktopShortcut)
+    internal static void Install(bool createDesktopShortcut, bool enableAutomaticUpdates)
     {
         using var installMutex = new Mutex(false, InstallMutexName); bool ownsMutex;
         try { ownsMutex = installMutex.WaitOne(0); } catch (AbandonedMutexException) { ownsMutex = true; }
@@ -84,7 +98,7 @@ internal static class SetupEngine
         {
             Directory.CreateDirectory(InstallDirectory); RecoverInterruptedInstall(); EnsureNotRunning();
             string staging = InstalledExecutable + ".installing", backup = InstalledExecutable + ".backup"; bool replaced = false;
-            var desktopState = FileState.Capture(DesktopShortcut); var startMenuState = FileState.Capture(StartMenuShortcut); var registryState = UninstallRegistryState.Capture();
+            var desktopState = FileState.Capture(DesktopShortcut); var startMenuState = FileState.Capture(StartMenuShortcut); var updateState = FileState.Capture(UpdateStatePath); var registryState = UninstallRegistryState.Capture();
             try
             {
                 ExtractVerifiedPayload(staging);
@@ -93,7 +107,7 @@ internal static class SetupEngine
                 File.Move(staging, InstalledExecutable, true); replaced = true;
                 Shortcut.Create(StartMenuShortcut, InstalledExecutable, InstallDirectory, "Analyze disk space with SpaceLens");
                 if (createDesktopShortcut) Shortcut.Create(DesktopShortcut, InstalledExecutable, InstallDirectory, "Analyze disk space with SpaceLens"); else TryDelete(DesktopShortcut);
-                RegisterUninstaller(); TryDelete(backup);
+                RegisterUninstaller(); WriteAutomaticUpdatePreference(enableAutomaticUpdates); TryDelete(backup);
             }
             catch (Exception installError)
             {
@@ -103,6 +117,7 @@ internal static class SetupEngine
                 TryRollback(() => { if (File.Exists(backup)) File.Move(backup, InstalledExecutable, true); }, rollbackErrors);
                 TryRollback(() => startMenuState.Restore(StartMenuShortcut), rollbackErrors);
                 TryRollback(() => desktopState.Restore(DesktopShortcut), rollbackErrors);
+                TryRollback(() => updateState.Restore(UpdateStatePath), rollbackErrors);
                 TryRollback(registryState.Restore, rollbackErrors);
                 if (rollbackErrors.Count > 0) { rollbackErrors.Insert(0, installError); throw new AggregateException("SpaceLens installation failed and the previous installation could not be restored completely.", rollbackErrors); }
                 throw;
@@ -116,6 +131,46 @@ internal static class SetupEngine
         var version = Assembly.GetExecutingAssembly().GetName().Version ?? throw new InvalidOperationException("Setup version metadata is missing.");
         if (version.Major < 0 || version.Minor < 0 || version.Build < 0 || version.Revision != 0) throw new InvalidOperationException("Setup version metadata must be a strict three-part version.");
         return new Version(version.Major, version.Minor, version.Build);
+    }
+
+    private sealed class UpdatePreference
+    {
+        public DateTimeOffset? LastAutomaticAttemptUtc { get; set; }
+        public bool? AutomaticChecksEnabled { get; set; }
+    }
+
+    private static bool ReadAutomaticUpdatePreference()
+    {
+        if (!File.Exists(UpdateStatePath)) return true;
+        try
+        {
+            using var file = new FileStream(UpdateStatePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            if (file.Length <= 0 || file.Length > 4096) return false;
+            return JsonSerializer.Deserialize<UpdatePreference>(file, UpdateStateJsonOptions)?.AutomaticChecksEnabled == true;
+        }
+        catch { return false; }
+    }
+
+    private static void WriteAutomaticUpdatePreference(bool enabled)
+    {
+        UpdatePreference preference = new() { AutomaticChecksEnabled = enabled };
+        try
+        {
+            using var file = new FileStream(UpdateStatePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            if (file.Length > 0 && file.Length <= 4096) preference.LastAutomaticAttemptUtc = JsonSerializer.Deserialize<UpdatePreference>(file, UpdateStateJsonOptions)?.LastAutomaticAttemptUtc;
+        }
+        catch { }
+        string directory = Path.GetDirectoryName(UpdateStatePath)!;
+        Directory.CreateDirectory(directory);
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(preference, UpdateStateJsonOptions);
+        if (json.Length > 4096) throw new InvalidDataException("The update preference file is too large.");
+        string temp = Path.Combine(directory, $".update-state-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { output.Write(json); output.Flush(true); }
+            File.Move(temp, UpdateStatePath, true);
+        }
+        finally { TryDelete(temp); }
     }
 
     private static void RecoverInterruptedInstall()
@@ -178,7 +233,7 @@ internal static class SetupEngine
     private static void RegisterUninstaller()
     {
         ValidatePayloadIdentity(InstalledExecutable); Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); using var key = Registry.CurrentUser.CreateSubKey(UninstallKey, true) ?? throw new InvalidOperationException("Could not create the uninstall entry.");
-        key.SetValue("DisplayName", "SpaceLens"); key.SetValue("DisplayVersion", SetupVersionText); key.SetValue("Publisher", "SpaceLens"); key.SetValue("DisplayIcon", $"\"{InstalledExecutable}\",0"); key.SetValue("InstallLocation", InstallDirectory); key.SetValue("UninstallString", $"\"{InstalledExecutable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{InstalledExecutable}\" --uninstall --quiet"); key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd")); key.SetValue("EstimatedSize", (int)Math.Min(int.MaxValue, new FileInfo(InstalledExecutable).Length / 1024), RegistryValueKind.DWord); key.SetValue("NoModify", 1, RegistryValueKind.DWord); key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+        key.SetValue("DisplayName", "SpaceLens"); key.SetValue("DisplayVersion", SetupVersionText); key.SetValue("Publisher", "SpaceLens"); key.SetValue("DisplayIcon", $"\"{InstalledExecutable}\",0"); key.SetValue("InstallLocation", InstallDirectory); key.SetValue("UninstallString", $"\"{InstalledExecutable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{InstalledExecutable}\" --uninstall --quiet"); key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd", CultureInfo.InvariantCulture)); key.SetValue("EstimatedSize", (int)Math.Min(int.MaxValue, new FileInfo(InstalledExecutable).Length / 1024), RegistryValueKind.DWord); key.SetValue("NoModify", 1, RegistryValueKind.DWord); key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
     }
 
     private sealed class FileState
@@ -241,7 +296,10 @@ internal static class SetupEngine
             if (process.ExitCode != 0) return false;
             string? shortcutTarget = Shortcut.ReadTarget(shortcut); var payloadVersion = ValidatePayloadIdentity(payload);
             using var form = new SetupForm(true); if (form.Handle == IntPtr.Zero) return false;
-            return File.Exists(payload) && new FileInfo(payload).Length > 1_000_000 && File.Exists(shortcut) && Path.GetFullPath(shortcutTarget ?? "").Equals(Path.GetFullPath(payload), StringComparison.OrdinalIgnoreCase) && payloadVersion == SetupVersion && SetupVersionText == payloadVersion.ToString(3) && Path.GetFullPath(InstallDirectory).StartsWith(Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)), StringComparison.OrdinalIgnoreCase);
+            bool updateChoiceVisible = form.Controls.OfType<CheckBox>().Any(control => control.Text.StartsWith("Check for updates automatically", StringComparison.Ordinal));
+            bool privacyLinkVisible = form.Controls.OfType<LinkLabel>().Any(control => control.Text == "Privacy information");
+            bool layoutInsideClient = form.Controls.Cast<Control>().Where(control => control.Visible).All(control => form.ClientRectangle.Contains(control.Bounds));
+            return File.Exists(payload) && new FileInfo(payload).Length > 1_000_000 && File.Exists(shortcut) && Path.GetFullPath(shortcutTarget ?? "").Equals(Path.GetFullPath(payload), StringComparison.OrdinalIgnoreCase) && payloadVersion == SetupVersion && SetupVersionText == payloadVersion.ToString(3) && Path.GetFullPath(InstallDirectory).StartsWith(Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)), StringComparison.OrdinalIgnoreCase) && updateChoiceVisible && privacyLinkVisible && layoutInsideClient;
         }
         catch { return false; }
         finally { try { Directory.Delete(directory, true); } catch { } }

@@ -1,0 +1,148 @@
+name: Sign release with SignPath
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact MAJOR.MINOR.PATCH version matching the selected vVERSION tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: sign-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign-release:
+    # SECURITY LOCK: keep this literal false until SignPath onboarding is complete
+    # and every `uses:` entry below is replaced by an audited full commit SHA.
+    if: ${{ false }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.301
+
+      - name: Resolve release version
+        id: version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage ResolveVersion -ExpectedVersion $env:EXPECTED_VERSION -GitHubOutput $env:GITHUB_OUTPUT
+
+      - name: Validate SignPath configuration
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_APP_ARTIFACT_CONFIG: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIG }}
+          SIGNPATH_SETUP_ARTIFACT_CONFIG: ${{ vars.SIGNPATH_SETUP_ARTIFACT_CONFIG }}
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage ValidateConfiguration
+
+      - name: Build and self-test unsigned application
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage BuildApp
+
+      - name: Upload unsigned application
+        id: upload-unsigned-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-spacelens-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/signpath/unsigned-app/SpaceLens.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Submit application signing request and wait for approval
+        id: sign-app
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIG }}
+          github-artifact-id: ${{ steps.upload-unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 9000
+          service-unavailable-timeout-in-seconds: 600
+          download-signed-artifact-timeout-in-seconds: 600
+          output-artifact-directory: ${{ github.workspace }}\artifacts\signpath\signed-app
+          parameters: |
+            version: ${{ toJSON(steps.version.outputs.version) }}
+
+      - name: Verify trusted application signature and self-test
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage ValidateSignedApp
+
+      - name: Build Setup from the signed application and self-test
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage BuildSetup
+
+      - name: Upload unsigned Setup
+        id: upload-unsigned-setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-spacelens-setup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/signpath/unsigned-setup/SpaceLens-Setup.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Submit Setup signing request and wait for approval
+        id: sign-setup
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_SETUP_ARTIFACT_CONFIG }}
+          github-artifact-id: ${{ steps.upload-unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 9000
+          service-unavailable-timeout-in-seconds: 600
+          download-signed-artifact-timeout-in-seconds: 600
+          output-artifact-directory: ${{ github.workspace }}\artifacts\signpath\signed-setup
+          parameters: |
+            version: ${{ toJSON(steps.version.outputs.version) }}
+
+      - name: Verify trusted Setup signature and self-test
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage ValidateSignedSetup
+
+      - name: Assemble signed release artifact
+        env:
+          SIGNPATH_APP_REQUEST_ID: ${{ steps.sign-app.outputs.signing-request-id }}
+          SIGNPATH_SETUP_REQUEST_ID: ${{ steps.sign-setup.outputs.signing-request-id }}
+        run: .\scripts\Build-SignPathRelease.ps1 -Stage Assemble
+
+      - name: Upload signed release artifact
+        id: upload-signed-release
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpaceLens-SignPath-v${{ steps.version.outputs.version }}
+          path: artifacts/signpath/final
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Record final artifact digest
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload-signed-release.outputs.artifact-digest }}
+          ARTIFACT_URL: ${{ steps.upload-signed-release.outputs.artifact-url }}
+        run: |
+          if ($env:ARTIFACT_DIGEST -notmatch '^[0-9a-fA-F]{64}$') { throw 'GitHub did not return a valid final artifact digest.' }
+          "## Offline finalization" >> $env:GITHUB_STEP_SUMMARY
+          "Download: $env:ARTIFACT_URL" >> $env:GITHUB_STEP_SUMMARY
+          "SHA-256: ``$($env:ARTIFACT_DIGEST.ToUpperInvariant())``" >> $env:GITHUB_STEP_SUMMARY
+          "Run ID: ``$env:GITHUB_RUN_ID``" >> $env:GITHUB_STEP_SUMMARY

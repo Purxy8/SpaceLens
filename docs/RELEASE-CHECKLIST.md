@@ -1,6 +1,9 @@
 # Release checklist
 
 - [ ] Version is strict `MAJOR.MINOR.PATCH` everywhere.
+- [ ] SignPath onboarding is complete and the approved project, policy, and artifact configurations match this repository.
+- [ ] SignPath signing runs from a fresh `vVERSION` tag, treated as immutable, for this exact source commit.
+- [ ] No previously published or signed tag was moved or reused.
 - [ ] Release notes and changelog are updated.
 - [ ] Application and Setup publish successfully with zero build errors.
 - [ ] Application packaged self-test passes.
@@ -10,10 +13,21 @@
 - [ ] Recycle Bin integration test passes for multiple disposable files.
 - [ ] Normal/minimized startup smoke test passes.
 - [ ] Setup embeds the exact intended application payload.
+- [ ] For a SignPath release, the application was signed first, its Authenticode signature and metadata were verified, and Setup embeds that exact signed application.
+- [ ] For a SignPath release, final Setup was separately signed and both signatures report a trusted, timestamped publisher before hashes were generated.
+- [ ] Before enabling the SignPath workflow, its literal safety lock was removed only after every `uses:` reference was pinned to an audited full commit SHA.
+- [ ] The downloaded SignPath ZIP matches the artifact SHA-256 copied separately from the trusted workflow summary, and the supplied workflow run ID is exact.
+- [ ] The supplied workflow run ID belongs to the expected successful tag run.
+- [ ] The downloaded SignPath ZIP is unmodified and remains outside the repository.
+- [ ] Finalization runs from a clean checkout of the exact source commit in `release-metadata.json`.
+- [ ] The downloaded SignPath `release-metadata.json` identifies `Purxy8/SpaceLens`, the expected tag/ref, source commit, workflow run ID/URL, both signing requests, exact hashes and sizes, and signer thumbprints.
 - [ ] Final executable hashes match their `.sha256` files.
 - [ ] `update.json` contains Setup's exact final size and SHA-256.
 - [ ] `update.json` verifies with the tracked public key.
 - [ ] No private key, secret, local path, log, cache, or generated binary is staged in Git.
 - [ ] Production package was built with `SpaceLensEnableDiagnostics=false`; diagnostic command switches are unavailable.
+- [ ] The offline ECDSA update key was never uploaded to GitHub Actions or SignPath.
 - [ ] Draft GitHub release contains all six required assets.
+- [ ] Release notes link the public code signing policy and accurately state whether this release is Authenticode-signed.
+- [ ] README, SECURITY, and release notes accurately distinguish older unsigned releases from the first Authenticode-signed release.
 - [ ] Latest-download links work before announcing the release.
