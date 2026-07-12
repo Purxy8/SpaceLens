@@ -10,7 +10,17 @@ using Microsoft.Win32.SafeHandles;
 
 namespace DesktopOrganizer;
 
-internal readonly record struct ElevatedScanResult(int Skipped, bool BackupPrivilegeEnabled);
+internal readonly record struct ElevatedScanResult(int Skipped, bool BackupPrivilegeEnabled, NtfsJournalCheckpoint JournalCheckpoint);
+internal readonly record struct ElevatedRefreshProgress(int ReceivedFiles, bool FullScan, int Skipped, string Message = "");
+internal sealed record ElevatedRefreshResult(
+    bool UsedFullScan,
+    List<FileItem> Files,
+    List<NativeFileId> Removed,
+    int JournalRecords,
+    int Skipped,
+    bool BackupPrivilegeEnabled,
+    NtfsJournalCheckpoint JournalCheckpoint,
+    string FallbackReason);
 
 /// <summary>
 /// Runs the existing buffered scanner in a short-lived elevated copy of the
@@ -71,6 +81,7 @@ internal static class ElevatedScanRunner
         token.ThrowIfCancellationRequested();
 
         string fullRoot = NormalizeAndValidateRoot(root);
+        var rootContext = new CanonicalRootContext(fullRoot);
         string pipeName = PipePrefix + Guid.NewGuid().ToString("N");
         byte[] nonce = RandomNumberGenerator.GetBytes(ElevatedScanProtocol.NonceLength);
         string nonceText = Convert.ToHexString(nonce);
@@ -92,10 +103,20 @@ internal static class ElevatedScanRunner
             child = await StartHelperAsync(pipeName, nonceText, parentPid, token).ConfigureAwait(false);
             await WaitForVerifiedClientAsync(server, child, cancellationTask, token).ConfigureAwait(false);
 
-            ElevatedScanFrame hello = await ReadHelperFrameAsync(server, child, token).ConfigureAwait(false);
-            byte[] receivedNonce = ElevatedScanProtocol.ReadHello(hello);
-            if (!CryptographicOperations.FixedTimeEquals(nonce, receivedNonce))
-                throw new InvalidDataException("The elevated scanner failed authentication.");
+            using (ElevatedScanFrame hello = await ReadHelperFrameAsync(server, child, token).ConfigureAwait(false))
+            {
+                try
+                {
+                    byte[] receivedNonce = ElevatedScanProtocol.ReadHello(hello);
+                    try
+                    {
+                        if (!CryptographicOperations.FixedTimeEquals(nonce, receivedNonce))
+                            throw new InvalidDataException("The elevated scanner failed authentication.");
+                    }
+                    finally { CryptographicOperations.ZeroMemory(receivedNonce); }
+                }
+                finally { hello.ClearBody(); }
+            }
 
             await ElevatedScanProtocol.WriteStartAsync(server, fullRoot, token).ConfigureAwait(false);
 
@@ -110,6 +131,8 @@ internal static class ElevatedScanRunner
                 {
                     await TrySendCancelAsync(server).ConfigureAwait(false);
                     await Task.WhenAny(readTask, child.WaitForExitAsync(), Task.Delay(GracefulExitTimeout)).ConfigureAwait(false);
+                    if (readTask.IsCompleted) await ObserveAndDisposeFrameAsync(readTask).ConfigureAwait(false);
+                    else _ = ObserveAndDisposeFrameAsync(readTask);
                     token.ThrowIfCancellationRequested();
                     throw new OperationCanceledException(token);
                 }
@@ -117,42 +140,213 @@ internal static class ElevatedScanRunner
                 ElevatedScanFrame frame;
                 try { frame = await readTask.ConfigureAwait(false); }
                 catch (EndOfStreamException ex) { throw await HelperDisconnectedAsync(child, ex).ConfigureAwait(false); }
-                switch (frame.Type)
+                using (frame)
                 {
-                    case ElevatedScanFrameType.Ready:
-                        if (readyReceived) throw new InvalidDataException("The elevated scanner returned more than one ready record.");
-                        readyReceived = true;
-                        started?.Report(ElevatedScanProtocol.ReadReady(frame));
-                        break;
-                    case ElevatedScanFrameType.Batch:
-                        {
-                            if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
-                            (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
-                            if (skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
-                            foreach (FileItem item in batch)
-                            {
-                                if (!IsPathUnderRoot(item.Path, fullRoot))
-                                    throw new InvalidDataException("The helper returned a path outside the selected scan root.");
-                            }
-                            receivedFiles = checked(receivedFiles + batch.Count);
-                            if (receivedFiles > ElevatedScanProtocol.MaximumTotalFiles)
-                                throw new InvalidDataException("The elevated scan exceeded the supported file-count limit.");
-                            lastSkipped = skipped;
-                            progress.Report((batch, skipped));
+                    switch (frame.Type)
+                    {
+                        case ElevatedScanFrameType.Ready:
+                            if (readyReceived) throw new InvalidDataException("The elevated scanner returned more than one ready record.");
+                            readyReceived = true;
+                            started?.Report(ElevatedScanProtocol.ReadReady(frame));
                             break;
-                        }
-                    case ElevatedScanFrameType.Completed:
-                        {
-                            if (!readyReceived) throw new InvalidDataException("The elevated scanner completed before it was ready.");
-                            ElevatedScanResult result = ElevatedScanProtocol.ReadCompleted(frame);
-                            if (result.Skipped < lastSkipped)
-                                throw new InvalidDataException("The helper returned an inconsistent final skipped-location count.");
-                            return result;
-                        }
-                    case ElevatedScanFrameType.Error:
-                        throw new InvalidOperationException("Elevated scan failed: " + ElevatedScanProtocol.ReadError(frame));
-                    default:
-                        throw new InvalidDataException($"The elevated scanner returned an unexpected {frame.Type} frame.");
+                        case ElevatedScanFrameType.Batch:
+                            {
+                                if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
+                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
+                                if (skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
+                                foreach (FileItem item in batch)
+                                {
+                                    // ReadBatch canonicalizes each untrusted path once. This
+                                    // precomputed prefix check is the authenticated-boundary
+                                    // containment decision and deliberately remains mandatory.
+                                    if (!rootContext.ContainsCanonicalPath(item.Path))
+                                        throw new InvalidDataException("The helper returned a path outside the selected scan root.");
+                                }
+                                receivedFiles = checked(receivedFiles + batch.Count);
+                                if (receivedFiles > ElevatedScanProtocol.MaximumTotalFiles)
+                                    throw new InvalidDataException("The elevated scan exceeded the supported file-count limit.");
+                                lastSkipped = skipped;
+                                progress.Report((batch, skipped));
+                                break;
+                            }
+                        case ElevatedScanFrameType.Completed:
+                            {
+                                if (!readyReceived) throw new InvalidDataException("The elevated scanner completed before it was ready.");
+                                ElevatedScanResult result = ElevatedScanProtocol.ReadCompleted(frame);
+                                if (result.Skipped < lastSkipped)
+                                    throw new InvalidDataException("The helper returned an inconsistent final skipped-location count.");
+                                return result;
+                            }
+                        case ElevatedScanFrameType.Error:
+                            throw new InvalidOperationException("Elevated scan failed: " + ElevatedScanProtocol.ReadError(frame));
+                        default:
+                            throw new InvalidDataException($"The elevated scanner returned an unexpected {frame.Type} frame.");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            try { server.Dispose(); } catch { }
+            if (child is not null)
+            {
+                await StopChildAsync(child).ConfigureAwait(false);
+                child.Dispose();
+            }
+            CryptographicOperations.ZeroMemory(nonce);
+        }
+    }
+
+    internal static async Task<ElevatedRefreshResult> RefreshAsync(
+        string root,
+        NtfsJournalCheckpoint checkpoint,
+        long baselineDriveUsedBytes,
+        CancellationToken token,
+        IProgress<ElevatedRefreshProgress>? progress = null,
+        IProgress<bool>? started = null)
+    {
+        if (!checkpoint.IsValid) throw new ArgumentException("The saved scan has no valid quick-refresh checkpoint.", nameof(checkpoint));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(baselineDriveUsedBytes);
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("NTFS quick refresh is available only on Windows.");
+        if (IsDotNetHost(Environment.ProcessPath)) throw new InvalidOperationException("Quick refresh is available only from the packaged SpaceLens application.");
+        token.ThrowIfCancellationRequested();
+
+        string fullRoot = NormalizeAndValidateRoot(root);
+        if (!NtfsChangeJournal.SupportsRoot(fullRoot, out string refreshReason)) throw new NotSupportedException(refreshReason);
+        var rootContext = new CanonicalRootContext(fullRoot);
+        string pipeName = PipePrefix + Guid.NewGuid().ToString("N");
+        byte[] nonce = RandomNumberGenerator.GetBytes(ElevatedScanProtocol.NonceLength);
+        string nonceText = Convert.ToHexString(nonce);
+        int parentPid = Environment.ProcessId;
+
+        using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            ServerPipeOptions,
+            PipeBufferSize,
+            PipeBufferSize);
+
+        Process? child = null;
+        Task cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, token);
+        try
+        {
+            child = await StartHelperAsync(pipeName, nonceText, parentPid, token).ConfigureAwait(false);
+            await WaitForVerifiedClientAsync(server, child, cancellationTask, token).ConfigureAwait(false);
+            using (ElevatedScanFrame hello = await ReadHelperFrameAsync(server, child, token).ConfigureAwait(false))
+            {
+                byte[] receivedNonce = ElevatedScanProtocol.ReadHello(hello);
+                try
+                {
+                    if (!CryptographicOperations.FixedTimeEquals(nonce, receivedNonce))
+                        throw new InvalidDataException("The elevated scanner failed authentication.");
+                }
+                finally { CryptographicOperations.ZeroMemory(receivedNonce); hello.ClearBody(); }
+            }
+
+            await ElevatedScanProtocol.WriteRefreshStartAsync(server, fullRoot, checkpoint, baselineDriveUsedBytes, token).ConfigureAwait(false);
+            var files = new List<FileItem>();
+            var removed = new List<NativeFileId>();
+            int lastSkipped = 0;
+            bool readyReceived = false, fallbackReceived = false;
+            bool backupPrivilege = false;
+            string fallbackReason = string.Empty;
+            while (true)
+            {
+                Task<ElevatedScanFrame> readTask = ElevatedScanProtocol.ReadFrameAsync(server, CancellationToken.None);
+                Task completed = await Task.WhenAny(readTask, cancellationTask).ConfigureAwait(false);
+                if (completed == cancellationTask)
+                {
+                    await TrySendCancelAsync(server).ConfigureAwait(false);
+                    await Task.WhenAny(readTask, child.WaitForExitAsync(), Task.Delay(GracefulExitTimeout)).ConfigureAwait(false);
+                    if (readTask.IsCompleted) await ObserveAndDisposeFrameAsync(readTask).ConfigureAwait(false);
+                    else _ = ObserveAndDisposeFrameAsync(readTask);
+                    token.ThrowIfCancellationRequested();
+                    throw new OperationCanceledException(token);
+                }
+
+                ElevatedScanFrame frame;
+                try { frame = await readTask.ConfigureAwait(false); }
+                catch (EndOfStreamException ex) { throw await HelperDisconnectedAsync(child, ex).ConfigureAwait(false); }
+                using (frame)
+                {
+                    switch (frame.Type)
+                    {
+                        case ElevatedScanFrameType.Ready:
+                            if (readyReceived) throw new InvalidDataException("The elevated scanner returned more than one ready record.");
+                            readyReceived = true;
+                            backupPrivilege = ElevatedScanProtocol.ReadReady(frame);
+                            started?.Report(backupPrivilege);
+                            break;
+                        case ElevatedScanFrameType.RefreshFallback:
+                            if (!readyReceived || fallbackReceived || files.Count != 0 || removed.Count != 0)
+                                throw new InvalidDataException("The helper returned an out-of-order quick-refresh fallback.");
+                            fallbackReceived = true;
+                            fallbackReason = ElevatedScanProtocol.ReadRefreshFallback(frame);
+                            progress?.Report(new(0, true, 0, fallbackReason));
+                            break;
+                        case ElevatedScanFrameType.Batch:
+                            {
+                                if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
+                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
+                                if (!fallbackReceived && skipped != 0) throw new InvalidDataException("A quick-refresh delta reported skipped full-scan locations.");
+                                if (fallbackReceived && skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
+                                foreach (FileItem item in batch)
+                                {
+                                    if (!rootContext.ContainsCanonicalPath(item.Path))
+                                        throw new InvalidDataException("The helper returned a path outside the selected scan root.");
+                                }
+                                if (files.Count > ElevatedScanProtocol.MaximumTotalFiles - batch.Count)
+                                    throw new InvalidDataException("The elevated refresh exceeded the supported file-count limit.");
+                                files.AddRange(batch);
+                                if ((long)files.Count + removed.Count > ElevatedScanProtocol.MaximumTotalFiles)
+                                    throw new InvalidDataException("The elevated refresh exceeded the combined affected-file limit.");
+                                lastSkipped = skipped;
+                                progress?.Report(new(files.Count, fallbackReceived, skipped));
+                                break;
+                            }
+                        case ElevatedScanFrameType.Removed:
+                            {
+                                if (!readyReceived || fallbackReceived) throw new InvalidDataException("The helper returned removed IDs during a full-scan fallback.");
+                                List<NativeFileId> batch = ElevatedScanProtocol.ReadRemoved(frame);
+                                foreach (NativeFileId id in batch)
+                                    if (id.VolumeSerial != checkpoint.VolumeSerial) throw new InvalidDataException("A removed-file identity belongs to a different volume.");
+                                if (removed.Count > ElevatedScanProtocol.MaximumTotalFiles - batch.Count)
+                                    throw new InvalidDataException("The elevated refresh exceeded the supported removed-file limit.");
+                                removed.AddRange(batch);
+                                if ((long)files.Count + removed.Count > ElevatedScanProtocol.MaximumTotalFiles)
+                                    throw new InvalidDataException("The elevated refresh exceeded the combined affected-file limit.");
+                                break;
+                            }
+                        case ElevatedScanFrameType.RefreshCompleted:
+                            {
+                                if (!readyReceived || fallbackReceived) throw new InvalidDataException("The helper returned an unexpected quick-refresh completion.");
+                                ElevatedRefreshCompletion result = ElevatedScanProtocol.ReadRefreshCompleted(frame);
+                                long affectedCount = checked((long)files.Count + removed.Count);
+                                if (!backupPrivilege
+                                    || affectedCount > ElevatedScanProtocol.MaximumTotalFiles
+                                    || result.JournalRecords < affectedCount
+                                    || result.Upserts != files.Count
+                                    || result.Removed != removed.Count
+                                    || result.Checkpoint.VolumeSerial != checkpoint.VolumeSerial
+                                    || result.Checkpoint.JournalId != checkpoint.JournalId
+                                    || result.Checkpoint.NextUsn < checkpoint.NextUsn)
+                                    throw new InvalidDataException("The helper returned inconsistent quick-refresh totals.");
+                                return new(false, files, removed, result.JournalRecords, 0, backupPrivilege, result.Checkpoint, string.Empty);
+                            }
+                        case ElevatedScanFrameType.Completed:
+                            {
+                                if (!readyReceived || !fallbackReceived) throw new InvalidDataException("The helper returned an unexpected full-scan completion.");
+                                ElevatedScanResult result = ElevatedScanProtocol.ReadCompleted(frame);
+                                if (result.Skipped < lastSkipped) throw new InvalidDataException("The helper returned an inconsistent final skipped-location count.");
+                                return new(true, files, [], 0, result.Skipped, result.BackupPrivilegeEnabled, result.JournalCheckpoint, fallbackReason);
+                            }
+                        case ElevatedScanFrameType.Error:
+                            throw new InvalidOperationException("Elevated refresh failed: " + ElevatedScanProtocol.ReadError(frame));
+                        default:
+                            throw new InvalidDataException($"The elevated scanner returned an unexpected {frame.Type} frame.");
+                    }
                 }
             }
         }
@@ -201,18 +395,60 @@ internal static class ElevatedScanRunner
 
             if (!IsAdministrator) throw new UnauthorizedAccessException("The scan helper did not receive administrator rights.");
 
-            ElevatedScanFrame startFrame = ElevatedScanProtocol.ReadFrameAsync(pipe, scanCancellation.Token).GetAwaiter().GetResult();
-            string root = NormalizeAndValidateRoot(ElevatedScanProtocol.ReadStart(startFrame));
+            string root;
+            bool refreshRequested;
+            NtfsJournalCheckpoint refreshCheckpoint = default;
+            long baselineDriveUsedBytes = 0;
+            using (ElevatedScanFrame startFrame = ElevatedScanProtocol.ReadFrameAsync(pipe, scanCancellation.Token).GetAwaiter().GetResult())
+            {
+                refreshRequested = startFrame.Type == ElevatedScanFrameType.RefreshStart;
+                if (refreshRequested)
+                {
+                    (string requestedRoot, refreshCheckpoint, baselineDriveUsedBytes) = ElevatedScanProtocol.ReadRefreshStart(startFrame);
+                    root = NormalizeAndValidateRoot(requestedRoot);
+                }
+                else root = NormalizeAndValidateRoot(ElevatedScanProtocol.ReadStart(startFrame));
+            }
+            var rootContext = new CanonicalRootContext(root);
             cancelWatcher = WatchForCancelAsync(pipe, scanCancellation);
 
             using WindowsBackupPrivilege backupPrivilege = WindowsBackupPrivilege.TryEnable();
             ElevatedScanProtocol.WriteReadyAsync(pipe, backupPrivilege.Enabled, scanCancellation.Token).GetAwaiter().GetResult();
+
+            if (refreshRequested)
+            {
+                NtfsJournalDelta delta = backupPrivilege.Enabled
+                    ? NtfsChangeJournal.ReadDelta(root, refreshCheckpoint, scanCancellation.Token)
+                    : NtfsJournalDelta.Fallback("Windows backup privilege is unavailable, so a complete scan is required.");
+                if (!delta.RequiresFullScan)
+                {
+                    long currentDriveUsedBytes = NtfsChangeJournal.TryGetWholeDriveUsed(root);
+                    string? allocationFallback = RefreshAllocationFallbackReason(baselineDriveUsedBytes, currentDriveUsedBytes, delta.JournalRecords);
+                    if (allocationFallback is not null) delta = NtfsJournalDelta.Fallback(allocationFallback);
+                }
+                if (!delta.RequiresFullScan)
+                {
+                    foreach (FileItem item in delta.Upserts)
+                        if (!rootContext.ContainsCanonicalPath(item.Path)) throw new InvalidDataException("The journal returned a path outside the selected root.");
+                    ElevatedScanProtocol.WriteBatchesAsync(pipe, delta.Upserts, 0, scanCancellation.Token).GetAwaiter().GetResult();
+                    ElevatedScanProtocol.WriteRemovedAsync(pipe, delta.Removed, scanCancellation.Token).GetAwaiter().GetResult();
+                    ElevatedScanProtocol.WriteRefreshCompletedAsync(pipe, new(delta.Checkpoint, delta.JournalRecords, delta.Upserts.Count, delta.Removed.Count), scanCancellation.Token).GetAwaiter().GetResult();
+                    return 0;
+                }
+                ElevatedScanProtocol.WriteRefreshFallbackAsync(pipe, delta.Message, scanCancellation.Token).GetAwaiter().GetResult();
+            }
+
+            NtfsJournalCheckpoint scanCheckpoint = default;
+            _ = NtfsChangeJournal.TryCapture(root, out scanCheckpoint, out _);
             var reporter = new ImmediateProgress<(List<FileItem> Batch, int Skipped)>(update =>
             {
                 scanCancellation.Token.ThrowIfCancellationRequested();
                 foreach (FileItem item in update.Batch)
                 {
-                    if (!IsPathUnderRoot(item.Path, root))
+                    // FastFileScanner emits paths from its already-canonical root.
+                    // Keep the helper-side defense without re-normalizing root and
+                    // every path; the parent independently canonicalizes and checks.
+                    if (!rootContext.ContainsCanonicalPath(item.Path))
                         throw new InvalidDataException("The scanner attempted to return a path outside the selected root.");
                 }
                 ElevatedScanProtocol.WriteBatchesAsync(pipe, update.Batch, update.Skipped, scanCancellation.Token).GetAwaiter().GetResult();
@@ -220,7 +456,7 @@ internal static class ElevatedScanRunner
 
             int skipped = FastFileScanner.Scan(root, reporter, scanCancellation.Token, strictReparseDirectories: true);
             scanCancellation.Token.ThrowIfCancellationRequested();
-            ElevatedScanProtocol.WriteCompletedAsync(pipe, skipped, backupPrivilege.Enabled, scanCancellation.Token).GetAwaiter().GetResult();
+            ElevatedScanProtocol.WriteCompletedAsync(pipe, skipped, backupPrivilege.Enabled, scanCancellation.Token, scanCheckpoint).GetAwaiter().GetResult();
             return 0;
         }
         catch (OperationCanceledException)
@@ -417,13 +653,27 @@ internal static class ElevatedScanRunner
         return new InvalidOperationException("The elevated scan helper closed unexpectedly before reporting a result.", inner);
     }
 
+    private static async Task ObserveAndDisposeFrameAsync(Task<ElevatedScanFrame> frameTask)
+    {
+        try
+        {
+            using ElevatedScanFrame frame = await frameTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // This is used only after cancellation has already won. Observing the
+            // read prevents an unobserved exception; a successfully completed
+            // pooled frame is disposed immediately.
+        }
+    }
+
     private static async Task WatchForCancelAsync(Stream pipe, CancellationTokenSource cancellation)
     {
         try
         {
             while (!cancellation.IsCancellationRequested)
             {
-                ElevatedScanFrame frame = await ElevatedScanProtocol.ReadFrameAsync(pipe, cancellation.Token).ConfigureAwait(false);
+                using ElevatedScanFrame frame = await ElevatedScanProtocol.ReadFrameAsync(pipe, cancellation.Token).ConfigureAwait(false);
                 ElevatedScanProtocol.ReadCancel(frame);
                 cancellation.Cancel();
                 return;
@@ -508,21 +758,6 @@ internal static class ElevatedScanRunner
         => !string.IsNullOrWhiteSpace(executable)
             && string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsPathUnderRoot(string path, string root)
-    {
-        try
-        {
-            string fullPath = Path.GetFullPath(path);
-            string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string prefix = fullRoot + Path.DirectorySeparatorChar;
-            return fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     private static string SafeErrorMessage(Exception exception)
     {
         string message = exception.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
@@ -532,6 +767,38 @@ internal static class ElevatedScanRunner
     private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T>
     {
         public void Report(T value) => report(value);
+    }
+
+    internal static string? RefreshAllocationFallbackReason(long baselineDriveUsedBytes, long currentDriveUsedBytes, int journalRecords)
+    {
+        if (baselineDriveUsedBytes <= 0) return "The saved scan has no trustworthy drive-allocation baseline.";
+        if (currentDriveUsedBytes <= 0) return "Current drive allocation could not be read safely.";
+        if (journalRecords == 0 && currentDriveUsedBytes != baselineDriveUsedBytes)
+            return "Drive allocation changed without a complete closed-file journal record.";
+        return null;
+    }
+
+    /// <summary>
+    /// A scan root is resolved through a Windows handle before this context is
+    /// constructed. Received paths are canonicalized once by ReadBatch; scanner
+    /// output is constructed beneath the same canonical root. Prefix comparison
+    /// can therefore preserve strict containment without repeated GetFullPath
+    /// calls and per-file root-prefix allocations.
+    /// </summary>
+    private sealed class CanonicalRootContext
+    {
+        private readonly string pathPrefix;
+
+        internal CanonicalRootContext(string canonicalRoot)
+        {
+            string rootWithoutSeparator = canonicalRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            pathPrefix = rootWithoutSeparator + Path.DirectorySeparatorChar;
+        }
+
+        internal bool ContainsCanonicalPath(string path)
+            => path.Length > pathPrefix.Length
+                && Path.IsPathFullyQualified(path)
+                && path.StartsWith(pathPrefix, StringComparison.OrdinalIgnoreCase);
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]

@@ -4,10 +4,11 @@ using Microsoft.Win32.SafeHandles;
 namespace DesktopOrganizer;
 
 /// <summary>
-/// Enumerates a directory a buffer at a time. On Windows, FILE_ID_BOTH_DIR_INFO
-/// supplies the logical size, allocated size, timestamps, attributes, and file
-/// ID without opening every file. The managed path is retained for file systems
-/// that do not implement that information class.
+/// Enumerates a directory a buffer at a time. On Windows,
+/// FILE_ID_EXTD_DIR_INFO (or FILE_ID_BOTH_DIR_INFO as a compatibility fallback)
+/// supplies logical and allocated size, timestamps, attributes, reparse tags,
+/// and file IDs without opening every file. A managed fallback remains for file
+/// systems that implement neither native information class.
 /// </summary>
 internal static class FastFileScanner
 {
@@ -16,6 +17,9 @@ internal static class FastFileScanner
     private const uint FileFlagOpenReparsePoint = 0x00200000;
     private const uint CloudTagMask = 0xFFFF0FFF;
     private const uint CloudTagBase = 0x9000001A;
+    private const uint ReparseTagNameSurrogate = 0x20000000;
+
+    internal static int NativeBufferSizeForDiagnostics => NativeDirectoryEnumerator.BufferSizeForDiagnostics;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileAttributeTagInformation
@@ -38,7 +42,7 @@ internal static class FastFileScanner
             if (!NativeResolvedPath.TryResolveDirectory(directory, out string resolved, out _)
                 || !NativeFileIdentity.TryGet(resolved, true, out NativeFileInformation identity)) return false;
             using var native = new NativeDirectoryEnumerator();
-            return native.Enumerate(resolved, identity.Id, resolved, identity.Id.VolumeSerial, CancellationToken.None, (_, _) => { }, out _) == NativeEnumerationResult.Complete;
+            return native.Enumerate(resolved, identity.Id, resolved, identity.Id.VolumeSerial, IsWholeVolumeRoot(resolved), CancellationToken.None, (_, _) => { }, out _) == NativeEnumerationResult.Complete;
         }
         catch { return false; }
     }
@@ -50,7 +54,7 @@ internal static class FastFileScanner
             using SafeFileHandle handle = CreateFileW(NativePath.For(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagOpenReparsePoint, IntPtr.Zero);
             if (handle.IsInvalid || !GetFileInformationByHandleEx(handle, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())) return false;
             return (information.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == FileAttributes.ReparsePoint
-                && (information.ReparseTag & CloudTagMask) == CloudTagBase;
+                && IsCloudTag(information.ReparseTag);
         }
         catch { return false; }
     }
@@ -70,6 +74,7 @@ internal static class FastFileScanner
         var visitedDirectories = new HashSet<NativeFileId>();
         var countedFiles = new HashSet<NativeFileId>();
         var batch = new List<FileItem>(ReportBatchSize);
+        bool wholeVolumeRoot = IsWholeVolumeRoot(fullRoot);
         uint rootVolume = 0;
         int skipped = 0;
 
@@ -93,8 +98,9 @@ internal static class FastFileScanner
                     queued.ExpectedId,
                     fullRoot,
                     rootVolume,
+                    wholeVolumeRoot,
                     token,
-                    (directory, entry) => ProcessNativeEntry(directory, entry, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, strictReparseDirectories),
+                    (directory, entry) => ProcessNativeEntry(directory, entry, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, ref batch, ref skipped, progress, strictReparseDirectories),
                     out string validatedDirectory);
 
                 if (result == NativeEnumerationResult.UnsupportedBeforeFirstEntry)
@@ -108,7 +114,7 @@ internal static class FastFileScanner
                             || !NativeFileIdentity.TryGet(fallbackPath, true, out NativeFileInformation fallbackIdentity)
                             || (queued.ExpectedId.FileIndex != 0 && fallbackIdentity.Id != queued.ExpectedId)
                             || (rootVolume != 0 && fallbackIdentity.Id.VolumeSerial != rootVolume)) skipped++;
-                        else EnumerateManaged(fallbackPath, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, token, false);
+                        else EnumerateManaged(fallbackPath, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, ref batch, ref skipped, progress, token, false);
                     }
                 }
                 else if (result == NativeEnumerationResult.Failed)
@@ -121,7 +127,7 @@ internal static class FastFileScanner
         }
         catch (OperationCanceledException)
         {
-            if (batch.Count > 0) progress.Report((new List<FileItem>(batch), skipped));
+            if (batch.Count > 0) progress.Report((batch, skipped));
             throw;
         }
 
@@ -137,7 +143,7 @@ internal static class FastFileScanner
         Stack<PendingDirectory> pending,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
-        List<FileItem> batch,
+        ref List<FileItem> batch,
         ref int skipped,
         IProgress<(List<FileItem>, int)> progress,
         bool strictReparseDirectories)
@@ -158,7 +164,10 @@ internal static class FastFileScanner
         {
             if (isReparsePoint)
             {
-                if (!IsCloudDirectory(path)
+                bool cloudDirectory = entry.ReparseTagKnown
+                    ? IsCloudTag(entry.ReparseTag)
+                    : IsCloudDirectory(path);
+                if (!cloudDirectory
                     || !NativeResolvedPath.TryResolveDirectory(path, out string resolvedDirectory, out _)
                     || !NativeResolvedPath.IsStrictlyUnder(resolvedDirectory, scanRoot)
                     || !NativeFileIdentity.TryGet(resolvedDirectory, true, out NativeFileInformation resolvedIdentity)
@@ -173,7 +182,8 @@ internal static class FastFileScanner
 
         // Cloud placeholders are also reparse points, but are not links. Keep
         // them so their local allocation (often zero) remains visible.
-        if (isReparsePoint && IsFileLink(path)) { skipped++; return; }
+        if (isReparsePoint
+            && (entry.ReparseTagKnown ? IsNameSurrogateTag(entry.ReparseTag) : IsFileLink(path))) { skipped++; return; }
 
         try
         {
@@ -192,7 +202,7 @@ internal static class FastFileScanner
                 safety);
             if (id.FileIndex != 0 && !countedFiles.Add(id)) item = item with { DiskBytes = 0 };
             batch.Add(item);
-            FlushIfFull(batch, skipped, progress);
+            FlushIfFull(ref batch, skipped, progress);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or System.Security.SecurityException or OverflowException)
         {
@@ -207,7 +217,7 @@ internal static class FastFileScanner
         Stack<PendingDirectory> pending,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
-        List<FileItem> batch,
+        ref List<FileItem> batch,
         ref int skipped,
         IProgress<(List<FileItem>, int)> progress,
         CancellationToken token,
@@ -273,16 +283,10 @@ internal static class FastFileScanner
                     batch.Add(item);
                 }
                 catch { skipped++; }
-                FlushIfFull(batch, skipped, progress);
+                FlushIfFull(ref batch, skipped, progress);
             }
         }
         catch { skipped++; }
-    }
-
-    private static bool IsDirectoryLink(string path)
-    {
-        try { return new DirectoryInfo(path).LinkTarget is not null; }
-        catch { return true; }
     }
 
     private static bool IsCloudDirectory(string path)
@@ -291,7 +295,7 @@ internal static class FastFileScanner
         {
             using SafeFileHandle handle = CreateFileW(NativePath.For(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
             if (handle.IsInvalid || !GetFileInformationByHandleEx(handle, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())) return false;
-            return (information.ReparseTag & CloudTagMask) == CloudTagBase;
+            return IsCloudTag(information.ReparseTag);
         }
         catch { return false; }
     }
@@ -302,6 +306,23 @@ internal static class FastFileScanner
         catch { return true; }
     }
 
+    private static bool IsCloudTag(uint tag) => (tag & CloudTagMask) == CloudTagBase;
+
+    private static bool IsNameSurrogateTag(uint tag) => (tag & ReparseTagNameSurrogate) != 0;
+
+    private static bool IsWholeVolumeRoot(string path)
+    {
+        try
+        {
+            string fullPath = Path.GetFullPath(path);
+            string? root = Path.GetPathRoot(fullPath);
+            string full = fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return root is not null
+                && full.Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
     private static DateTime ToLocalFileTime(long value)
     {
         if (value <= 0) return default;
@@ -309,14 +330,15 @@ internal static class FastFileScanner
         catch (ArgumentOutOfRangeException) { return default; }
     }
 
-    private static void FlushIfFull(List<FileItem> batch, int skipped, IProgress<(List<FileItem>, int)> progress)
+    private static void FlushIfFull(ref List<FileItem> batch, int skipped, IProgress<(List<FileItem>, int)> progress)
     {
         if (batch.Count < ReportBatchSize) return;
-        // Progress<T> posts to the UI thread asynchronously. Never publish the
-        // mutable working list itself and then clear it, or the UI can receive
-        // an empty batch after a fast scan has already reused that list.
-        progress.Report((new List<FileItem>(batch), skipped));
-        batch.Clear();
+        // Progress<T> may post asynchronously. Transfer ownership of the full
+        // list and continue with a fresh one so the scanner never mutates a
+        // batch after publishing it and does not clone thousands of records.
+        List<FileItem> completed = batch;
+        batch = new List<FileItem>(ReportBatchSize);
+        progress.Report((completed, skipped));
     }
 
     private enum NativeEnumerationResult
@@ -335,25 +357,55 @@ internal static class FastFileScanner
         long CreationTime,
         long LastWriteTime,
         FileAttributes Attributes,
-        ulong FileIndex);
+        ulong FileIndex,
+        uint ReparseTag,
+        bool ReparseTagKnown);
 
     private sealed class NativeDirectoryEnumerator : IDisposable
     {
-        private const int BufferSize = 64 * 1024;
-        private const int HeaderSize = 104;
+        // 64 KiB remains the default after a same-tree benchmark showed that
+        // 256 KiB reduced throughput on a directory-heavy Windows tree. The
+        // bounded environment override keeps larger buffers easy to benchmark
+        // on other storage without imposing that regression on every machine.
+        private const int DefaultBufferSize = 64 * 1024;
+        private const int MinimumBufferSize = 64 * 1024;
+        private const int MaximumBufferSize = 1024 * 1024;
+        private const int BothHeaderSize = 104;
+        private const int ExtendedHeaderSize = 88;
         private const int FileIdBothDirectoryInfo = 10;
         private const int FileIdBothDirectoryRestartInfo = 11;
+        private const int FileIdExtdDirectoryInfo = 19;
+        private const int FileIdExtdDirectoryRestartInfo = 20;
         private const int ErrorNoMoreFiles = 18;
         private const uint FileListDirectory = 0x00000001;
         private const uint FileFlagBackupSemantics = 0x02000000;
 
-        private readonly IntPtr buffer = Marshal.AllocHGlobal(BufferSize);
+        private static readonly int ConfiguredBufferSize = ResolveBufferSize();
+        private readonly int bufferSize = ConfiguredBufferSize;
+        private readonly IntPtr buffer = Marshal.AllocHGlobal(ConfiguredBufferSize);
+        private bool? extendedDirectoryInfoSupported;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            internal uint FileAttributes;
+            internal uint CreationTimeLow; internal uint CreationTimeHigh;
+            internal uint LastAccessTimeLow; internal uint LastAccessTimeHigh;
+            internal uint LastWriteTimeLow; internal uint LastWriteTimeHigh;
+            internal uint VolumeSerialNumber;
+            internal uint FileSizeHigh; internal uint FileSizeLow;
+            internal uint NumberOfLinks;
+            internal uint FileIndexHigh; internal uint FileIndexLow;
+        }
+
+        internal static int BufferSizeForDiagnostics => ConfiguredBufferSize;
 
         internal NativeEnumerationResult Enumerate(
             string path,
             NativeFileId expectedId,
             string scanRoot,
             uint rootVolume,
+            bool wholeVolumeRoot,
             CancellationToken token,
             Action<string, NativeDirectoryEntry> accept,
             out string resolvedPath)
@@ -383,42 +435,93 @@ internal static class FastFileScanner
                     return IsUnsupportedError(openError) ? NativeEnumerationResult.UnsupportedBeforeFirstEntry : NativeEnumerationResult.Failed;
                 }
 
-                if (!NativeResolvedPath.TryResolveHandle(handle, out resolvedPath, out _)
-                    || !NativeResolvedPath.IsUnderOrEqual(resolvedPath, scanRoot)
-                    || !NativeFileIdentity.TryGet(handle, out NativeFileInformation liveIdentity)
-                    || (expectedId.FileIndex != 0 && liveIdentity.Id != expectedId)
-                    || (rootVolume != 0 && liveIdentity.Id.VolumeSerial != rootVolume)) return NativeEnumerationResult.Failed;
+                if (!TryGetDirectoryIdentity(handle, out NativeFileId liveId)
+                    || (expectedId.FileIndex != 0 && liveId != expectedId)
+                    || (rootVolume != 0 && liveId.VolumeSerial != rootVolume)) return NativeEnumerationResult.Failed;
+
+                // On a whole-volume scan, a nonzero expected ID came from the
+                // already-validated parent enumeration. Matching it after open
+                // prevents an object swap, and the volume check provides the
+                // containment boundary without resolving every directory path.
+                // Folder scans still resolve every handle because a directory
+                // could be moved outside that narrower root and linked back.
+                if (wholeVolumeRoot && expectedId.FileIndex != 0 && NativeResolvedPath.IsUnderOrEqual(path, scanRoot))
+                    resolvedPath = path;
+                else if (!NativeResolvedPath.TryResolveHandle(handle, out resolvedPath, out _)
+                    || !NativeResolvedPath.IsUnderOrEqual(resolvedPath, scanRoot))
+                    return NativeEnumerationResult.Failed;
 
                 bool firstCall = true;
                 bool returnedAny = false;
+                bool useExtended = extendedDirectoryInfoSupported != false;
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();
-                    int informationClass = firstCall ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
-                    if (!GetFileInformationByHandleEx(handle, informationClass, buffer, BufferSize))
+                    int informationClass = useExtended
+                        ? (firstCall ? FileIdExtdDirectoryRestartInfo : FileIdExtdDirectoryInfo)
+                        : (firstCall ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo);
+                    if (!GetFileInformationByHandleEx(handle, informationClass, buffer, bufferSize))
                     {
                         int error = Marshal.GetLastPInvokeError();
-                        if (error == ErrorNoMoreFiles) return NativeEnumerationResult.Complete;
+                        if (error == ErrorNoMoreFiles)
+                        {
+                            if (useExtended) extendedDirectoryInfoSupported ??= true;
+                            return NativeEnumerationResult.Complete;
+                        }
+                        if (useExtended && !returnedAny && IsUnsupportedError(error))
+                        {
+                            // Restart the still-empty enumeration with the older
+                            // 64-bit record class on file systems that do not
+                            // implement FILE_ID_EXTD_DIR_INFO.
+                            extendedDirectoryInfoSupported = false;
+                            useExtended = false;
+                            firstCall = true;
+                            continue;
+                        }
                         return returnedAny || !IsUnsupportedError(error) ? NativeEnumerationResult.Failed : NativeEnumerationResult.UnsupportedBeforeFirstEntry;
                     }
 
+                    if (useExtended) extendedDirectoryInfoSupported ??= true;
                     firstCall = false;
                     int offset = 0;
+                    int headerSize = useExtended ? ExtendedHeaderSize : BothHeaderSize;
                     while (true)
                     {
                         token.ThrowIfCancellationRequested();
-                        if (offset < 0 || offset > BufferSize - HeaderSize) return NativeEnumerationResult.Failed;
+                        if (offset < 0 || offset > bufferSize - headerSize) return NativeEnumerationResult.Failed;
 
                         uint nextOffset = unchecked((uint)Marshal.ReadInt32(buffer, offset));
                         uint nameBytes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 60));
-                        if ((nameBytes & 1) != 0 || nameBytes > BufferSize - HeaderSize || offset + HeaderSize + nameBytes > BufferSize) return NativeEnumerationResult.Failed;
+                        int availableNameBytes = bufferSize - offset - headerSize;
+                        if ((nameBytes & 1) != 0 || nameBytes > (uint)availableNameBytes) return NativeEnumerationResult.Failed;
 
-                        string? name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + HeaderSize), checked((int)nameBytes / sizeof(char)));
+                        string? name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + headerSize), checked((int)nameBytes / sizeof(char)));
                         if (!string.IsNullOrEmpty(name) && name is not "." and not "..")
                         {
                             long endOfFile = Marshal.ReadInt64(buffer, offset + 40);
                             long allocationSize = Marshal.ReadInt64(buffer, offset + 48);
                             if (endOfFile < 0 || allocationSize < 0) return NativeEnumerationResult.Failed;
+
+                            ulong fileIndex;
+                            uint reparseTag;
+                            bool reparseTagKnown;
+                            if (useExtended)
+                            {
+                                ulong low = unchecked((ulong)Marshal.ReadInt64(buffer, offset + 72));
+                                ulong high = unchecked((ulong)Marshal.ReadInt64(buffer, offset + 80));
+                                // SpaceLens currently stores a 64-bit file ID.
+                                // Do not truncate a genuine 128-bit ReFS ID and
+                                // accidentally merge unrelated entries.
+                                fileIndex = high == 0 ? low : 0;
+                                reparseTag = unchecked((uint)Marshal.ReadInt32(buffer, offset + 68));
+                                reparseTagKnown = true;
+                            }
+                            else
+                            {
+                                fileIndex = unchecked((ulong)Marshal.ReadInt64(buffer, offset + 96));
+                                reparseTag = 0;
+                                reparseTagKnown = false;
+                            }
 
                             accept(resolvedPath, new(
                                 name,
@@ -427,17 +530,44 @@ internal static class FastFileScanner
                                 Marshal.ReadInt64(buffer, offset + 8),
                                 Marshal.ReadInt64(buffer, offset + 24),
                                 unchecked((FileAttributes)(uint)Marshal.ReadInt32(buffer, offset + 56)),
-                                unchecked((ulong)Marshal.ReadInt64(buffer, offset + 96))));
+                                fileIndex,
+                                reparseTag,
+                                reparseTagKnown));
                             returnedAny = true;
                         }
 
                         if (nextOffset == 0) break;
-                        int minimumEntrySize = checked((HeaderSize + (int)nameBytes + 7) & ~7);
-                        if ((nextOffset & 7) != 0 || nextOffset < minimumEntrySize || nextOffset > BufferSize - offset) return NativeEnumerationResult.Failed;
+                        int minimumEntrySize = checked((headerSize + (int)nameBytes + 7) & ~7);
+                        if ((nextOffset & 7) != 0 || nextOffset < minimumEntrySize || nextOffset > bufferSize - offset) return NativeEnumerationResult.Failed;
                         offset = checked(offset + (int)nextOffset);
                     }
                 }
             }
+        }
+
+        private static bool TryGetDirectoryIdentity(SafeFileHandle handle, out NativeFileId id)
+        {
+            id = default;
+            if (!GetFileInformationByHandle(handle, out ByHandleFileInformation information)
+                || (information.FileAttributes & (uint)FileAttributes.Directory) == 0) return false;
+            ulong index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+            if (index == 0) return false;
+            id = new(information.VolumeSerialNumber, index);
+            return true;
+        }
+
+        private static int ResolveBufferSize()
+        {
+            string? configured = Environment.GetEnvironmentVariable("SPACELENS_SCAN_BUFFER_KB");
+            if (int.TryParse(configured, out int kilobytes))
+            {
+                int bytes;
+                try { bytes = checked(kilobytes * 1024); }
+                catch (OverflowException) { return DefaultBufferSize; }
+                if (bytes >= MinimumBufferSize && bytes <= MaximumBufferSize && (bytes & (bytes - 1)) == 0)
+                    return bytes;
+            }
+            return DefaultBufferSize;
         }
 
         private static bool IsUnsupportedError(int error) => error is 1 or 50 or 87;
@@ -461,5 +591,11 @@ internal static class FastFileScanner
             int informationClass,
             IntPtr fileInformation,
             int bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information);
     }
 }

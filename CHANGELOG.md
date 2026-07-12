@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.6.0 — 2026-07-12
+
+- Added conservative NTFS Quick Refresh after a saved whole-drive full-access scan: the elevated helper reads closed-file journal records, reopens every changed live file by stable ID, and automatically performs a complete scan when Windows reports detected uncertainty in the journal, directory tree, hard links, streams, identities, containment, or drive accounting. Because NTFS can coalesce writes while another application keeps a file open, the interface always offers a Complete rescan for an exact freshly rebuilt snapshot.
+- Upgraded native enumeration to extended Windows directory records with direct reparse tags, lighter directory identity checks, a whole-volume canonical-path fast path, zero-copy batch handoff, and strict fallback for unsupported filesystems or 128-bit identities.
+- Rewrote full-access IPC around pooled disposable frames and bounded span readers/writers, eliminating per-record streams and repeated UTF-8/path allocations while preserving authenticated parent-side canonical containment validation.
+- Coalesced live progress and filter work, prevented UI callback backlog, showed results before cache compression finishes, added phase timings, reduced redundant cache/view passes, and clarified standard Quick scan versus Administrator full access.
+- Added v7 saved scans with validated NTFS journal checkpoints and seamless v6/v5/v4/v3 compatibility; hostile, stale, partial, cross-volume, expired-journal, and oversized data still fail closed.
+- Expanded protocol, cache migration, journal parser, reparse, hard-link, sparse-file, cancellation, allocation, packaged, and performance regression coverage.
 - Added truthful privacy documentation plus install-time and in-app controls for automatic GitHub update checks; scan results and file information remain local.
 - Prepared SignPath Foundation code signing with public policy/roles, metadata-restricted artifact configurations, code ownership, and a safety-locked two-stage GitHub-hosted workflow pending onboarding and full-SHA action pinning.
 - Added an offline finalizer that verifies the workflow artifact ZIP digest, run/ref and source commit, signing-request IDs, hashes, product metadata, Authenticode signatures, and timestamps before signing the existing update manifest and assembling release assets.
