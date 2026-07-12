@@ -401,3 +401,8 @@ finally {
     Remove-DisposableTestDirectory -Path $outsideDirectory -OwnedRoot ([IO.Path]::GetTempPath()) -ExpectedLeafPattern '^spacelens-release-security-[0-9a-f]{32}$' -AllowSandboxAccessDenied
     Remove-DisposableTestDirectory -Path $syntheticWorkspace -OwnedRoot ([IO.Path]::GetTempPath()) -ExpectedLeafPattern '^spacelens-agent-root-[0-9a-f]{32}$' -AllowSandboxAccessDenied
 }
+
+# GitHub's pwsh wrapper propagates a stale native child exit code even when
+# every PowerShell assertion and cleanup above succeeded. Publish the script's
+# actual result directly; every failure path throws before this point.
+exit 0
