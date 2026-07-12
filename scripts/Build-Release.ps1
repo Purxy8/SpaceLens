@@ -206,7 +206,7 @@ $publishedApp = Join-Path $appPublish 'SpaceLens.exe'
 $app = Join-Path $package 'SpaceLens.exe'
 Copy-Item -LiteralPath $publishedApp -Destination $app
 Write-HashFile -Path $app
-Invoke-PackagedExecutable -Path $app -Arguments @('--self-test') -Description 'SpaceLens packaged self-test'
+Invoke-PackagedExecutable -Path $app -Arguments @('--self-test') -Description 'SpaceLens packaged self-test' -TimeoutSeconds 180
 & (Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1') -Executable $app -WorkDirectory $intermediate
 
 $payloadProperty = "-p:SpaceLensPayload=$app"
@@ -236,7 +236,7 @@ $publishedSetup = Join-Path $setupPublish 'SpaceLens-Setup.exe'
 $setup = Join-Path $package 'SpaceLens-Setup.exe'
 Copy-Item -LiteralPath $publishedSetup -Destination $setup
 Write-HashFile -Path $setup
-Invoke-PackagedExecutable -Path $setup -Arguments @('--self-test') -Description 'SpaceLens Setup packaged self-test'
+Invoke-PackagedExecutable -Path $setup -Arguments @('--self-test') -Description 'SpaceLens Setup packaged self-test' -TimeoutSeconds 180
 
 Invoke-DotNet -Arguments @(
     'publish', $signerProject,
