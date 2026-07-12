@@ -167,7 +167,10 @@ function Invoke-PackagedExecutable {
                 }
             }
         }
-        $process = Start-Process -FilePath $launchPath -ArgumentList $argumentLine -PassThru -WindowStyle Hidden
+        $process = if ($script:restrictedTestLauncher) {
+            Start-Process -FilePath $launchPath -ArgumentList $argumentLine -PassThru -NoNewWindow
+        }
+        else { Start-Process -FilePath $launchPath -ArgumentList $argumentLine -PassThru -WindowStyle Hidden }
     }
     finally {
         foreach ($entry in $savedInjectionEnvironment.GetEnumerator()) {

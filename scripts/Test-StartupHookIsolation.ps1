@@ -75,7 +75,7 @@ public static class StartupHook
                         [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)
                     }
                 }
-                $process = Start-Process -FilePath ([IO.Path]::GetFullPath($RestrictedLauncher)) -ArgumentList ('"' + $resolvedExecutable + '" "--self-test"') -PassThru -Wait -WindowStyle Hidden
+                $process = Start-Process -FilePath ([IO.Path]::GetFullPath($RestrictedLauncher)) -ArgumentList ('"' + $resolvedExecutable + '" "--self-test"') -PassThru -Wait -NoNewWindow
             }
             finally { foreach ($entry in $savedInjection.GetEnumerator()) { [Environment]::SetEnvironmentVariable([string]$entry.Key, [string]$entry.Value, [EnvironmentVariableTarget]::Process) } }
         }
