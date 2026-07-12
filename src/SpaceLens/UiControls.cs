@@ -37,14 +37,14 @@ internal sealed class GradientHeaderPanel : Panel
 
 internal sealed class ActivityStrip : Control
 {
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 40 };
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 65 };
     private float position;
     private bool active;
 
     internal ActivityStrip()
     {
         DoubleBuffered = true; SetStyle(ControlStyles.ResizeRedraw, true); Height = 4; TabStop = false;
-        timer.Tick += (_, _) => { position += 0.035f; if (position > 1.2f) position = -0.25f; Invalidate(); };
+        timer.Tick += (_, _) => { position += 0.055f; if (position > 1.2f) position = -0.25f; Invalidate(); };
     }
 
     internal void SetActive(bool value)

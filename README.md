@@ -38,11 +38,11 @@ On Windows 10 or 11 (64-bit):
 
 1. Download `SpaceLens-Setup.exe` from the latest release.
 2. Run it and optionally create a Desktop shortcut.
-3. Start SpaceLens, select a normal folder on a local fixed drive, leave **Full access scan (Administrator)** enabled for broader protected-location coverage, and choose **Scan now**. Approve the Windows UAC prompt with the same Windows account. Clear the option for network shares, removable drives, directory-link roots, or a standard scan.
+3. Start SpaceLens, select a folder on a local fixed drive, leave **Full access scan (Administrator)** enabled for broader protected-location coverage, and choose **Scan now**. Approve the Windows UAC prompt with the same Windows account. SpaceLens resolves directory-link roots to their canonical fixed-drive location; clear the option for network shares, removable drives, or a standard scan.
 
 The release also contains a portable `SpaceLens.exe` that runs without installation. The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning.
 
-SpaceLens 1.4 can open v4 and v3 saved-scan caches from earlier releases. Run one fresh full-access scan after upgrading so safety metadata and the new accounting summary are saved.
+SpaceLens 1.5 uses a smaller and more strongly validated v6 cache and can migrate v5, v4, and v3 saved scans from earlier releases. Run one fresh full-access scan after upgrading for the most accurate current accounting.
 
 ## Build from source
 

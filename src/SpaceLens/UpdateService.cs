@@ -44,6 +44,8 @@ internal static class UpdateService
     private const string FeedUrl = "https://github.com/Purxy8/SpaceLens/releases/latest/download/update.json";
     internal const string ReleasePage = "https://github.com/Purxy8/SpaceLens/releases";
     private const long MaximumInstallerBytes = 250L * 1024 * 1024;
+    private const int MaximumManifestBytes = 64 * 1024;
+    private const int MaximumStateBytes = 4 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
     private static string StatePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-state.json");
 
@@ -57,7 +59,7 @@ internal static class UpdateService
 
     internal static bool AutomaticCheckIsDue()
     {
-        try { using var doc = JsonDocument.Parse(File.ReadAllText(StatePath)); DateTimeOffset last = doc.RootElement.GetProperty("lastAutomaticAttemptUtc").GetDateTimeOffset(); TimeSpan age = DateTimeOffset.UtcNow - last; return age < TimeSpan.Zero || age >= TimeSpan.FromHours(24); } catch { return true; }
+        try { using var file = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete); if (file.Length > MaximumStateBytes) return true; using var doc = JsonDocument.Parse(file); DateTimeOffset last = doc.RootElement.GetProperty("lastAutomaticAttemptUtc").GetDateTimeOffset(); TimeSpan age = DateTimeOffset.UtcNow - last; return age < TimeSpan.Zero || age >= TimeSpan.FromHours(24); } catch { return true; }
     }
 
     internal static void RecordAutomaticAttempt()
@@ -68,7 +70,7 @@ internal static class UpdateService
     internal static async Task<UpdateManifest?> CheckAsync(CancellationToken token)
     {
         using HttpClient client = CreateClient(); using var response = await client.GetAsync(FeedUrl, HttpCompletionOption.ResponseHeadersRead, token); response.EnsureSuccessStatusCode(); ValidateFinalTransport(response.RequestMessage?.RequestUri);
-        if (response.Content.Headers.ContentLength is > 65536) throw new InvalidDataException("The update manifest is too large."); byte[] bytes = await response.Content.ReadAsByteArrayAsync(token); if (bytes.Length > 65536) throw new InvalidDataException("The update manifest is too large.");
+        if (response.Content.Headers.ContentLength is > MaximumManifestBytes) throw new InvalidDataException("The update manifest is too large."); await using Stream manifestStream = await response.Content.ReadAsStreamAsync(token); byte[] bytes = await ReadBoundedAsync(manifestStream, MaximumManifestBytes, token);
         UpdateManifest manifest = ParseAndValidate(bytes); if (!SemanticVersion.TryParse(CurrentVersionText, out var current)) throw new InvalidOperationException("The installed application version is invalid."); SemanticVersion.TryParse(manifest.Version, out var available); return available.CompareTo(current) > 0 ? manifest : null;
     }
 
@@ -133,7 +135,7 @@ internal static class UpdateService
     {
         try
         {
-            byte[] json = File.ReadAllBytes(manifestPath); if (json.Length > 65536) throw new InvalidDataException("The update manifest is too large.");
+            using var manifestStream = new FileStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read); if (manifestStream.Length > MaximumManifestBytes) throw new InvalidDataException("The update manifest is too large."); byte[] json = ReadBoundedAsync(manifestStream, MaximumManifestBytes, CancellationToken.None).GetAwaiter().GetResult();
             UpdateManifest manifest = ParseAndValidate(json);
             if (!manifest.Version.Equals(CurrentVersionText, StringComparison.Ordinal)) throw new InvalidDataException($"The manifest version {manifest.Version} does not match SpaceLens {CurrentVersionText}.");
             VerifyInstallerFile(installerPath, manifest); return 0;
@@ -144,6 +146,21 @@ internal static class UpdateService
     private static HttpClient CreateClient()
     {
         var handler = new HttpClientHandler { AllowAutoRedirect = true, MaxAutomaticRedirections = 5, CheckCertificateRevocationList = true, AutomaticDecompression = DecompressionMethods.None }; var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) }; client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("SpaceLens", CurrentVersionText)); return client;
+    }
+    internal static async Task<byte[]> ReadBoundedAsync(Stream source, int maximumBytes, CancellationToken token)
+    {
+        if (maximumBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        using var destination = new MemoryStream(Math.Min(maximumBytes, 16 * 1024));
+        byte[] buffer = new byte[Math.Min(16 * 1024, maximumBytes + 1)];
+        while (true)
+        {
+            int remaining = maximumBytes + 1 - checked((int)destination.Length);
+            if (remaining <= 0) throw new InvalidDataException("The update manifest is too large.");
+            int read = await source.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, remaining)), token).ConfigureAwait(false);
+            if (read == 0) return destination.ToArray();
+            destination.Write(buffer, 0, read);
+            if (destination.Length > maximumBytes) throw new InvalidDataException("The update manifest is too large.");
+        }
     }
     private static void ValidateFinalTransport(Uri? uri) { if (uri is null || uri.Scheme != Uri.UriSchemeHttps || !(uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase))) throw new SecurityException("GitHub redirected the update request to an unexpected location."); }
 }

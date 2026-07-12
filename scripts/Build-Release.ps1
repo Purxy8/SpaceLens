@@ -183,7 +183,7 @@ $package = Join-Path $intermediate 'package'
 New-Item -ItemType Directory -Force -Path $appPublish, $setupPublish, $package | Out-Null
 
 $resolvedNuGetConfig = ''
-$appRestoreArguments = @('restore', $appProject, '-r', 'win-x64', '--nologo')
+$appRestoreArguments = @('restore', $appProject, '-r', 'win-x64', '-p:SpaceLensEnableDiagnostics=false', '--nologo')
 if ($NuGetConfig) {
     $resolvedNuGetConfig = (Resolve-Path -LiteralPath $NuGetConfig).Path
     if (-not (Test-Path -LiteralPath $resolvedNuGetConfig -PathType Leaf)) {
@@ -203,6 +203,7 @@ Invoke-DotNet -Arguments @(
     '-p:EnableCompressionInSingleFile=true',
     '-p:DebugType=None',
     '-p:DebugSymbols=false',
+    '-p:SpaceLensEnableDiagnostics=false',
     '-o', $appPublish,
     '--no-restore',
     '--nologo'

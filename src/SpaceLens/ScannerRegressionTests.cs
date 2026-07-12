@@ -23,6 +23,7 @@ internal static class ScannerRegressionTests
         string id = Guid.NewGuid().ToString("N");
         string root = Path.Combine(Path.GetTempPath(), "SpaceLens-scanner-test-" + id);
         string outsideRoot = Path.Combine(Path.GetTempPath(), "SpaceLens-scanner-outside-" + id);
+        string rootLink = Path.Combine(Path.GetTempPath(), "SpaceLens-scanner-root-link-" + id);
         var stopwatch = new Stopwatch();
         int expectedFileCount = 0;
 
@@ -58,6 +59,15 @@ internal static class ScannerRegressionTests
             string outsideSentinel = Path.Combine(outsideRoot, "must-not-be-indexed.bin");
             File.WriteAllBytes(outsideSentinel, [1, 2, 3, 4]);
             bool linkedDirectoryCreated = TryCreateDirectoryLink(Path.Combine(root, "outside-link"), outsideRoot);
+            bool rootLinkCreated = TryCreateDirectoryLink(rootLink, outsideRoot);
+
+            if (rootLinkCreated)
+            {
+                var aliasFiles = new List<FileItem>();
+                _ = AnalyzerForm.ScanFiles(rootLink, new ImmediateProgress<(List<FileItem> Batch, int Skipped)>(update => aliasFiles.AddRange(update.Batch)), CancellationToken.None);
+                if (aliasFiles.Count != 1 || !string.Equals(aliasFiles[0].Path, outsideSentinel, StringComparison.OrdinalIgnoreCase) || aliasFiles[0].Path.StartsWith(rootLink, StringComparison.OrdinalIgnoreCase))
+                    return Fail("Scanner did not canonicalize a reparse-point scan root before classification.", aliasFiles.Count, TimeSpan.Zero);
+            }
 
             var scanned = new List<FileItem>(expectedFileCount);
             int progressCalls = 0;
@@ -154,6 +164,7 @@ internal static class ScannerRegressionTests
         finally
         {
             TryDeleteDirectory(root);
+            TryDeleteDirectory(rootLink);
             TryDeleteDirectory(outsideRoot);
         }
     }
@@ -210,12 +221,14 @@ internal static class ScannerRegressionTests
 
     private static void WriteBenchmark(ScannerRegressionResult result)
     {
+#if SPACELENS_DIAGNOSTICS
         try
         {
             string? path = Environment.GetEnvironmentVariable("SPACELENS_SCANNER_BENCHMARK_LOG");
             if (!string.IsNullOrWhiteSpace(path)) File.WriteAllText(path, $"{result.FileCount}|{result.Elapsed.TotalMilliseconds:F3}|{result.FilesPerSecond:F3}");
         }
         catch { }
+#endif
     }
 
     private static void TryDeleteDirectory(string path)
@@ -259,4 +272,63 @@ internal static class ScannerBenchmark
     }
 
     private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T> { public void Report(T value) => report(value); }
+}
+
+/// <summary>
+/// Packaged end-to-end probe for the real UAC boundary and authenticated pipe.
+/// It writes aggregate diagnostics only; file paths never leave the scan process.
+/// </summary>
+internal static class ElevatedScanIntegrationTest
+{
+    internal static async Task<int> RunAsync(string root, string reportPath)
+    {
+        int files = 0;
+        long bytes = 0;
+        int progressCalls = 0;
+        int readyCalls = 0;
+        bool readyBackupPrivilege = false;
+        try
+        {
+            string fullRoot = Path.GetFullPath(root);
+            string fullReport = Path.GetFullPath(reportPath);
+            var progress = new ImmediateProgress<(List<FileItem> Batch, int Skipped)>(update =>
+            {
+                progressCalls++;
+                files = checked(files + update.Batch.Count);
+                foreach (FileItem item in update.Batch) bytes = checked(bytes + item.DiskBytes);
+            });
+            bool parentWasAdministrator = ElevatedScanRunner.IsAdministrator;
+            var ready = new ImmediateProgress<bool>(enabled => { readyCalls++; readyBackupPrivilege = enabled; });
+            ElevatedScanResult result = await ElevatedScanRunner.ScanAsync(fullRoot, progress, CancellationToken.None, ready).ConfigureAwait(false);
+            bool passed = !parentWasAdministrator && readyCalls == 1 && readyBackupPrivilege && files > 0 && progressCalls > 0 && result.BackupPrivilegeEnabled;
+            WriteReport(fullReport, new { passed, parentWasAdministrator, readyCalls, readyBackupPrivilege, files, bytes, progressCalls, result.Skipped, result.BackupPrivilegeEnabled });
+            return passed ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            try { WriteReport(Path.GetFullPath(reportPath), new { passed = false, files, bytes, progressCalls, error = ex.GetType().Name, message = ex.Message }); } catch { }
+            return 1;
+        }
+    }
+
+    private static void WriteReport(string path, object value)
+    {
+        string? directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(temporary, JsonSerializer.Serialize(value));
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+        }
+    }
+
+    private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
+    }
 }

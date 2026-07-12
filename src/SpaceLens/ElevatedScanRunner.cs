@@ -24,6 +24,8 @@ internal static class ElevatedScanRunner
     private const string PipePrefix = "SpaceLens.Scan.";
     private const int ErrorCancelled = 1223;
     private const int PipeBufferSize = 64 * 1024;
+    internal static readonly PipeOptions ServerPipeOptions = PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
+    internal static readonly PipeOptions HelperClientPipeOptions = PipeOptions.Asynchronous;
     private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(2);
 
@@ -60,10 +62,12 @@ internal static class ElevatedScanRunner
     internal static async Task<ElevatedScanResult> ScanAsync(
         string root,
         IProgress<(List<FileItem> Batch, int Skipped)> progress,
-        CancellationToken token)
+        CancellationToken token,
+        IProgress<bool>? started = null)
     {
         ArgumentNullException.ThrowIfNull(progress);
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Elevated scanning is available only on Windows.");
+        if (IsDotNetHost(Environment.ProcessPath)) throw new InvalidOperationException("Full access scan is available only from the packaged SpaceLens application.");
         token.ThrowIfCancellationRequested();
 
         string fullRoot = NormalizeAndValidateRoot(root);
@@ -77,7 +81,7 @@ internal static class ElevatedScanRunner
             PipeDirection.InOut,
             1,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly,
+            ServerPipeOptions,
             PipeBufferSize,
             PipeBufferSize);
 
@@ -88,7 +92,7 @@ internal static class ElevatedScanRunner
             child = await StartHelperAsync(pipeName, nonceText, parentPid, token).ConfigureAwait(false);
             await WaitForVerifiedClientAsync(server, child, cancellationTask, token).ConfigureAwait(false);
 
-            ElevatedScanFrame hello = await ElevatedScanProtocol.ReadFrameAsync(server, token).ConfigureAwait(false);
+            ElevatedScanFrame hello = await ReadHelperFrameAsync(server, child, token).ConfigureAwait(false);
             byte[] receivedNonce = ElevatedScanProtocol.ReadHello(hello);
             if (!CryptographicOperations.FixedTimeEquals(nonce, receivedNonce))
                 throw new InvalidDataException("The elevated scanner failed authentication.");
@@ -97,6 +101,7 @@ internal static class ElevatedScanRunner
 
             int receivedFiles = 0;
             int lastSkipped = 0;
+            bool readyReceived = false;
             while (true)
             {
                 Task<ElevatedScanFrame> readTask = ElevatedScanProtocol.ReadFrameAsync(server, CancellationToken.None);
@@ -109,11 +114,19 @@ internal static class ElevatedScanRunner
                     throw new OperationCanceledException(token);
                 }
 
-                ElevatedScanFrame frame = await readTask.ConfigureAwait(false);
+                ElevatedScanFrame frame;
+                try { frame = await readTask.ConfigureAwait(false); }
+                catch (EndOfStreamException ex) { throw await HelperDisconnectedAsync(child, ex).ConfigureAwait(false); }
                 switch (frame.Type)
                 {
+                    case ElevatedScanFrameType.Ready:
+                        if (readyReceived) throw new InvalidDataException("The elevated scanner returned more than one ready record.");
+                        readyReceived = true;
+                        started?.Report(ElevatedScanProtocol.ReadReady(frame));
+                        break;
                     case ElevatedScanFrameType.Batch:
                         {
+                            if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
                             (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
                             if (skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
                             foreach (FileItem item in batch)
@@ -130,6 +143,7 @@ internal static class ElevatedScanRunner
                         }
                     case ElevatedScanFrameType.Completed:
                         {
+                            if (!readyReceived) throw new InvalidDataException("The elevated scanner completed before it was ready.");
                             ElevatedScanResult result = ElevatedScanProtocol.ReadCompleted(frame);
                             if (result.Skipped < lastSkipped)
                                 throw new InvalidDataException("The helper returned an inconsistent final skipped-location count.");
@@ -173,14 +187,18 @@ internal static class ElevatedScanRunner
                 ".",
                 pipeName,
                 PipeDirection.InOut,
-                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                HelperClientPipeOptions);
             pipe.ConnectAsync((int)ConnectionTimeout.TotalMilliseconds, scanCancellation.Token).GetAwaiter().GetResult();
+
+            // Send the authenticated hello as soon as the OS pipe connection is
+            // established. If a later startup check fails, the parent can now
+            // receive the real error instead of an unexplained end-of-stream.
+            ElevatedScanProtocol.WriteHelloAsync(pipe, nonce, CancellationToken.None).GetAwaiter().GetResult();
+            handshakeSent = true;
 
             if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out uint serverPid) || serverPid != unchecked((uint)parentPid))
                 throw new InvalidDataException("The elevated scan pipe is not owned by the requesting process.");
 
-            ElevatedScanProtocol.WriteHelloAsync(pipe, nonce, CancellationToken.None).GetAwaiter().GetResult();
-            handshakeSent = true;
             if (!IsAdministrator) throw new UnauthorizedAccessException("The scan helper did not receive administrator rights.");
 
             ElevatedScanFrame startFrame = ElevatedScanProtocol.ReadFrameAsync(pipe, scanCancellation.Token).GetAwaiter().GetResult();
@@ -188,6 +206,7 @@ internal static class ElevatedScanRunner
             cancelWatcher = WatchForCancelAsync(pipe, scanCancellation);
 
             using WindowsBackupPrivilege backupPrivilege = WindowsBackupPrivilege.TryEnable();
+            ElevatedScanProtocol.WriteReadyAsync(pipe, backupPrivilege.Enabled, scanCancellation.Token).GetAwaiter().GetResult();
             var reporter = new ImmediateProgress<(List<FileItem> Batch, int Skipped)>(update =>
             {
                 scanCancellation.Token.ThrowIfCancellationRequested();
@@ -206,6 +225,15 @@ internal static class ElevatedScanRunner
         }
         catch (OperationCanceledException)
         {
+            if (pipe is not null && pipe.IsConnected && handshakeSent)
+            {
+                try
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    ElevatedScanProtocol.WriteErrorAsync(pipe, "The elevated scan was canceled or its parent connection was lost.", timeout.Token).GetAwaiter().GetResult();
+                }
+                catch { }
+            }
             return 5;
         }
         catch (Exception ex)
@@ -355,8 +383,38 @@ internal static class ElevatedScanRunner
         catch (OperationCanceledException) { }
         catch
         {
-            try { cancellation.Cancel(); } catch { }
+            // Failure to create a process watcher is not proof that the parent
+            // exited. The authenticated pipe watcher remains the liveness
+            // fallback; canceling here caused valid scans to end silently.
         }
+    }
+
+    private static async Task<ElevatedScanFrame> ReadHelperFrameAsync(
+        NamedPipeServerStream server,
+        Process child,
+        CancellationToken token)
+    {
+        try
+        {
+            return await ElevatedScanProtocol.ReadFrameAsync(server, token).ConfigureAwait(false);
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw await HelperDisconnectedAsync(child, ex).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<Exception> HelperDisconnectedAsync(Process child, EndOfStreamException inner)
+    {
+        try
+        {
+            if (!child.HasExited)
+                await Task.WhenAny(child.WaitForExitAsync(), Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
+            if (child.HasExited)
+                return new InvalidOperationException($"The elevated scan helper closed unexpectedly (exit code {child.ExitCode}).", inner);
+        }
+        catch { }
+        return new InvalidOperationException("The elevated scan helper closed unexpectedly before reporting a result.", inner);
     }
 
     private static async Task WatchForCancelAsync(Stream pipe, CancellationTokenSource cancellation)
@@ -418,11 +476,11 @@ internal static class ElevatedScanRunner
             || fullRoot.Length > 32_767)
             throw new ArgumentException("Full access scan supports local fixed-drive paths only.", nameof(root));
         if (!Directory.Exists(fullRoot)) throw new DirectoryNotFoundException("The selected elevated scan root does not exist.");
+        if (!NativeResolvedPath.TryResolveDirectory(fullRoot, out fullRoot, out string resolutionError))
+            throw new IOException("The selected elevated scan root could not be resolved safely: " + resolutionError);
         string? driveRoot = Path.GetPathRoot(fullRoot);
         if (string.IsNullOrWhiteSpace(driveRoot) || new DriveInfo(driveRoot).DriveType != DriveType.Fixed)
             throw new ArgumentException("Full access scan supports local fixed drives only.", nameof(root));
-        if ((File.GetAttributes(fullRoot) & FileAttributes.ReparsePoint) != 0)
-            throw new ArgumentException("A reparse-point directory cannot be used as a full access scan root.", nameof(root));
         return fullRoot;
     }
 
@@ -432,6 +490,7 @@ internal static class ElevatedScanRunner
         {
             string? currentExecutable = Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(currentExecutable)) return false;
+            if (IsDotNetHost(currentExecutable)) return false;
             string currentPath = Path.GetFullPath(currentExecutable);
             using Process parent = Process.GetProcessById(parentPid);
             string? parentExecutable = parent.MainModule?.FileName;
@@ -444,6 +503,10 @@ internal static class ElevatedScanRunner
         }
         catch { return false; }
     }
+
+    private static bool IsDotNetHost(string? executable)
+        => !string.IsNullOrWhiteSpace(executable)
+            && string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsPathUnderRoot(string path, string root)
     {

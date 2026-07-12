@@ -20,5 +20,9 @@ internal static class CrashLog
     {
         try { Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!); File.AppendAllText(LogPath, $"[{DateTimeOffset.UtcNow:O}] SpaceLens {UpdateService.CurrentVersionText}\r\n{exception}\r\n\r\n"); } catch { }
     }
-    private static string LogPath => Environment.GetEnvironmentVariable("SPACELENS_ERROR_LOG") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "crash.log");
+    private static string LogPath =>
+#if SPACELENS_DIAGNOSTICS
+        Environment.GetEnvironmentVariable("SPACELENS_ERROR_LOG") ??
+#endif
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "crash.log");
 }

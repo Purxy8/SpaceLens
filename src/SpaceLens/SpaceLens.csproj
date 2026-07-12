@@ -12,6 +12,10 @@
     <Product>SpaceLens</Product>
     <Company>SpaceLens</Company>
     <Description>Fast, friendly Windows disk space analyzer</Description>
+    <SpaceLensEnableDiagnostics Condition="'$(SpaceLensEnableDiagnostics)' == ''">false</SpaceLensEnableDiagnostics>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(SpaceLensEnableDiagnostics)' == 'true'">
+    <DefineConstants>$(DefineConstants);SPACELENS_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="assets\update-public-key.pem" LogicalName="SpaceLens.UpdatePublicKey.pem" />

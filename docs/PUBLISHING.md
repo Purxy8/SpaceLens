@@ -28,6 +28,8 @@ The script reads the version from `Directory.Build.props`. `-Version` remains av
 
 The script publishes self-contained x64 builds, runs both packaged GUI self-tests and checks their process exit codes, calculates hashes, creates and signs the update manifest, and verifies the signature with the tracked public key. It then invokes the packaged SpaceLens production verifier against the signed manifest and exact Setup binary. Only after every check succeeds does it create `artifacts/release/VERSION/`, containing exactly the six GitHub release assets. Unsigned CI/local runs stop after verified packaging in `artifacts/intermediate/` and do not create a final release directory.
 
+Before a release that changes elevated scanning, also publish a temporary local diagnostic build with `-p:SpaceLensEnableDiagnostics=true` and run its `--integration-test-elevated-scan` probe from a medium-integrity shell against a disposable fixed-drive folder. The aggregate JSON report must show an unelevated parent, exactly one Ready event with backup privilege enabled, at least one file batch, and a successful final result. Never upload that diagnostic build; the signed production workflow explicitly forces `SpaceLensEnableDiagnostics=false`.
+
 ## Code-signing order
 
 If Authenticode signing is available, use this order:

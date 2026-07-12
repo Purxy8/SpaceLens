@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0 — 2026-07-12
+
+- Fixed the Full access UAC helper disconnect by keeping `CurrentUserOnly` on the protected pipe server while removing the incompatible elevated-client owner check; startup errors now return useful diagnostics instead of a generic closed-connection message.
+- Reworked elevated scan transport around pooled, bounded 8,000-file frames and category codes, cutting per-file copies, retained duplicate strings, large-object churn, and UI progress backlog.
+- Reduced scanner and filter allocation with single-pass classification, span-based filename/extension checks, lazy display names, value-type totals, v6 category-coded caches, and lower-memory rescans.
+- Canonicalized scan roots through Windows handles and added same-handle directory identity/containment validation so junctions, aliases, mount points, and directory-swap races cannot escape the selected root.
+- Hardened cleanup with final-path, metadata, safety, and file-ID revalidation immediately before each recycle-only Shell operation on a background STA worker; directories and ambiguous sensitive files fail closed.
+- Added root file identity to v6 caches, v5/v4/v3 migration, alias migration, compressed/decompressed/text/count limits, directory-record rejection, and bounded state/manifest reads.
+- Gated developer diagnostics out of production builds, rejected framework-dependent self-elevation, made release builds explicitly disable diagnostics, and expanded protocol, cache, reparse, updater, performance, and Recycle Bin regression coverage.
+
 ## 1.4.0 — 2026-07-11
 
 - Added an optional full-access Administrator scan that keeps the UI unelevated, enables only Windows backup privilege in a short-lived authenticated helper, and preserves the fast buffered scanner.

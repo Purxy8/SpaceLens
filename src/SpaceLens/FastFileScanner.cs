@@ -35,8 +35,22 @@ internal static class FastFileScanner
     {
         try
         {
+            if (!NativeResolvedPath.TryResolveDirectory(directory, out string resolved, out _)
+                || !NativeFileIdentity.TryGet(resolved, true, out NativeFileInformation identity)) return false;
             using var native = new NativeDirectoryEnumerator();
-            return native.Enumerate(directory, CancellationToken.None, _ => { }) == NativeEnumerationResult.Complete;
+            return native.Enumerate(resolved, identity.Id, resolved, identity.Id.VolumeSerial, CancellationToken.None, (_, _) => { }, out _) == NativeEnumerationResult.Complete;
+        }
+        catch { return false; }
+    }
+
+    internal static bool IsKnownCloudFileReparsePoint(string path)
+    {
+        try
+        {
+            using SafeFileHandle handle = CreateFileW(NativePath.For(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (handle.IsInvalid || !GetFileInformationByHandleEx(handle, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())) return false;
+            return (information.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == FileAttributes.ReparsePoint
+                && (information.ReparseTag & CloudTagMask) == CloudTagBase;
         }
         catch { return false; }
     }
@@ -50,9 +64,9 @@ internal static class FastFileScanner
         catch { return 1; }
 
         if (!Directory.Exists(fullRoot)) return 1;
+        if (!NativeResolvedPath.TryResolveDirectory(fullRoot, out fullRoot, out _)) return 1;
 
-        var pending = new Stack<string>();
-        pending.Push(fullRoot);
+        var pending = new Stack<PendingDirectory>();
         var visitedDirectories = new HashSet<NativeFileId>();
         var countedFiles = new HashSet<NativeFileId>();
         var batch = new List<FileItem>(ReportBatchSize);
@@ -63,28 +77,52 @@ internal static class FastFileScanner
         {
             rootVolume = rootIdentity.Id.VolumeSerial;
             if (rootIdentity.Id.FileIndex != 0) visitedDirectories.Add(rootIdentity.Id);
+            pending.Push(new(fullRoot, rootIdentity.Id));
         }
+        else pending.Push(new(fullRoot, default));
 
         using var native = new NativeDirectoryEnumerator();
-        while (pending.Count > 0)
+        try
         {
-            token.ThrowIfCancellationRequested();
-            string directory = pending.Pop();
-            NativeEnumerationResult result = native.Enumerate(
-                directory,
-                token,
-                entry => ProcessNativeEntry(directory, entry, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, strictReparseDirectories));
+            while (pending.Count > 0)
+            {
+                token.ThrowIfCancellationRequested();
+                PendingDirectory queued = pending.Pop();
+                NativeEnumerationResult result = native.Enumerate(
+                    queued.Path,
+                    queued.ExpectedId,
+                    fullRoot,
+                    rootVolume,
+                    token,
+                    (directory, entry) => ProcessNativeEntry(directory, entry, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, strictReparseDirectories),
+                    out string validatedDirectory);
 
-            if (result == NativeEnumerationResult.UnsupportedBeforeFirstEntry)
-            {
-                EnumerateManaged(directory, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, token, strictReparseDirectories);
+                if (result == NativeEnumerationResult.UnsupportedBeforeFirstEntry)
+                {
+                    if (strictReparseDirectories) skipped++;
+                    else
+                    {
+                        string fallbackPath = validatedDirectory.Length == 0 ? queued.Path : validatedDirectory;
+                        if (!NativeResolvedPath.TryResolveDirectory(fallbackPath, out fallbackPath, out _)
+                            || !NativeResolvedPath.IsUnderOrEqual(fallbackPath, fullRoot)
+                            || !NativeFileIdentity.TryGet(fallbackPath, true, out NativeFileInformation fallbackIdentity)
+                            || (queued.ExpectedId.FileIndex != 0 && fallbackIdentity.Id != queued.ExpectedId)
+                            || (rootVolume != 0 && fallbackIdentity.Id.VolumeSerial != rootVolume)) skipped++;
+                        else EnumerateManaged(fallbackPath, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, batch, ref skipped, progress, token, false);
+                    }
+                }
+                else if (result == NativeEnumerationResult.Failed)
+                {
+                    // Do not retry after a partially returned native enumeration:
+                    // that would duplicate files already reported to the UI.
+                    skipped++;
+                }
             }
-            else if (result == NativeEnumerationResult.Failed)
-            {
-                // Do not retry after a partially returned native enumeration:
-                // that would duplicate files already reported to the UI.
-                skipped++;
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (batch.Count > 0) progress.Report((new List<FileItem>(batch), skipped));
+            throw;
         }
 
         if (batch.Count > 0) progress.Report((batch, skipped));
@@ -94,8 +132,9 @@ internal static class FastFileScanner
     private static void ProcessNativeEntry(
         string directory,
         NativeDirectoryEntry entry,
+        string scanRoot,
         uint rootVolume,
-        Stack<string> pending,
+        Stack<PendingDirectory> pending,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
         List<FileItem> batch,
@@ -117,9 +156,18 @@ internal static class FastFileScanner
 
         if (isDirectory)
         {
-            if (isReparsePoint && (strictReparseDirectories ? !IsCloudDirectory(path) : IsDirectoryLink(path))) { skipped++; return; }
+            if (isReparsePoint)
+            {
+                if (!IsCloudDirectory(path)
+                    || !NativeResolvedPath.TryResolveDirectory(path, out string resolvedDirectory, out _)
+                    || !NativeResolvedPath.IsStrictlyUnder(resolvedDirectory, scanRoot)
+                    || !NativeFileIdentity.TryGet(resolvedDirectory, true, out NativeFileInformation resolvedIdentity)
+                    || (rootVolume != 0 && resolvedIdentity.Id.VolumeSerial != rootVolume)) { skipped++; return; }
+                path = resolvedDirectory;
+                id = resolvedIdentity.Id;
+            }
             if (id.FileIndex != 0 && !visitedDirectories.Add(id)) { skipped++; return; }
-            pending.Push(path);
+            pending.Push(new(path, id));
             return;
         }
 
@@ -129,7 +177,7 @@ internal static class FastFileScanner
 
         try
         {
-            string category = AnalyzerForm.Classify(path);
+            (string category, FileSafety safety) = AnalyzerForm.ClassifyForScan(path, entry.Attributes, pathIsCanonical: true);
             FileItem item = new(
                 path,
                 entry.AllocationSize,
@@ -141,7 +189,7 @@ internal static class FastFileScanner
                 id.VolumeSerial,
                 id.FileIndex,
                 entry.Attributes,
-                AnalyzerForm.ClassifySafety(path, category, entry.Attributes));
+                safety);
             if (id.FileIndex != 0 && !countedFiles.Add(id)) item = item with { DiskBytes = 0 };
             batch.Add(item);
             FlushIfFull(batch, skipped, progress);
@@ -154,8 +202,9 @@ internal static class FastFileScanner
 
     private static void EnumerateManaged(
         string directory,
+        string scanRoot,
         uint rootVolume,
-        Stack<string> pending,
+        Stack<PendingDirectory> pending,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
         List<FileItem> batch,
@@ -171,15 +220,23 @@ internal static class FastFileScanner
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    var info = new DirectoryInfo(child);
+                    string candidate = child;
+                    var info = new DirectoryInfo(candidate);
                     bool reparse = (info.Attributes & FileAttributes.ReparsePoint) != 0;
-                    if (reparse && (strictReparseDirectories ? !IsCloudDirectory(child) : info.LinkTarget is not null)) { skipped++; continue; }
-                    if (NativeFileIdentity.TryGet(child, true, out var identity))
+                    if (reparse)
+                    {
+                        if (!IsCloudDirectory(candidate)
+                            || !NativeResolvedPath.TryResolveDirectory(candidate, out candidate, out _)
+                            || !NativeResolvedPath.IsStrictlyUnder(candidate, scanRoot)) { skipped++; continue; }
+                    }
+                    NativeFileId childId = default;
+                    if (NativeFileIdentity.TryGet(candidate, true, out var identity))
                     {
                         if ((rootVolume != 0 && identity.Id.VolumeSerial != rootVolume) || !visitedDirectories.Add(identity.Id)) { skipped++; continue; }
+                        childId = identity.Id;
                     }
                     else if (reparse) { skipped++; continue; }
-                    pending.Push(child);
+                    pending.Push(new(candidate, childId));
                 }
                 catch { skipped++; }
             }
@@ -210,8 +267,8 @@ internal static class FastFileScanner
                         volumeSerial = identity.Id.VolumeSerial;
                         fileIndex = identity.Id.FileIndex;
                     }
-                    string category = AnalyzerForm.Classify(path);
-                    FileItem item = new(path, allocated, logical, info.LastWriteTime, category, info.CreationTime, estimated, volumeSerial, fileIndex, attributes, AnalyzerForm.ClassifySafety(path, category, attributes));
+                    (string category, FileSafety safety) = AnalyzerForm.ClassifyForScan(path, attributes, pathIsCanonical: true);
+                    FileItem item = new(path, allocated, logical, info.LastWriteTime, category, info.CreationTime, estimated, volumeSerial, fileIndex, attributes, safety);
                     if (hasIdentity && !countedFiles.Add(identity.Id)) item = item with { DiskBytes = 0, AllocationEstimated = false };
                     batch.Add(item);
                 }
@@ -269,6 +326,8 @@ internal static class FastFileScanner
         Failed
     }
 
+    private readonly record struct PendingDirectory(string Path, NativeFileId ExpectedId);
+
     private readonly record struct NativeDirectoryEntry(
         string Name,
         long EndOfFile,
@@ -290,8 +349,16 @@ internal static class FastFileScanner
 
         private readonly IntPtr buffer = Marshal.AllocHGlobal(BufferSize);
 
-        internal NativeEnumerationResult Enumerate(string path, CancellationToken token, Action<NativeDirectoryEntry> accept)
+        internal NativeEnumerationResult Enumerate(
+            string path,
+            NativeFileId expectedId,
+            string scanRoot,
+            uint rootVolume,
+            CancellationToken token,
+            Action<string, NativeDirectoryEntry> accept,
+            out string resolvedPath)
         {
+            resolvedPath = string.Empty;
             SafeFileHandle handle;
             try
             {
@@ -315,6 +382,12 @@ internal static class FastFileScanner
                     int openError = Marshal.GetLastPInvokeError();
                     return IsUnsupportedError(openError) ? NativeEnumerationResult.UnsupportedBeforeFirstEntry : NativeEnumerationResult.Failed;
                 }
+
+                if (!NativeResolvedPath.TryResolveHandle(handle, out resolvedPath, out _)
+                    || !NativeResolvedPath.IsUnderOrEqual(resolvedPath, scanRoot)
+                    || !NativeFileIdentity.TryGet(handle, out NativeFileInformation liveIdentity)
+                    || (expectedId.FileIndex != 0 && liveIdentity.Id != expectedId)
+                    || (rootVolume != 0 && liveIdentity.Id.VolumeSerial != rootVolume)) return NativeEnumerationResult.Failed;
 
                 bool firstCall = true;
                 bool returnedAny = false;
@@ -347,7 +420,7 @@ internal static class FastFileScanner
                             long allocationSize = Marshal.ReadInt64(buffer, offset + 48);
                             if (endOfFile < 0 || allocationSize < 0) return NativeEnumerationResult.Failed;
 
-                            accept(new(
+                            accept(resolvedPath, new(
                                 name,
                                 endOfFile,
                                 allocationSize,
