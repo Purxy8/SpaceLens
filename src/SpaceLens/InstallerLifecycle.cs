@@ -1,8 +1,25 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Cryptography;
 using Microsoft.Win32;
 
 namespace DesktopOrganizer;
+
+internal static class ProcessSecurity
+{
+    internal const string ElevatedPerUserOperationMessage = "SpaceLens is running with Administrator rights. Close it and run it normally, then try again. SpaceLens updates, installation, and uninstall do not require Administrator access.";
+
+    internal static bool IsElevated
+    {
+        get
+        {
+            return SecurityPolicy.TryGetCurrentProcessElevation(out bool elevated, out _) ? elevated : true;
+        }
+    }
+
+    internal static bool ShouldRefusePerUserOperation(bool elevated) => elevated;
+}
 
 internal static class InstallerLifecycle
 {
@@ -16,6 +33,11 @@ internal static class InstallerLifecycle
 
     internal static void BeginUninstall(bool quiet)
     {
+        if (ProcessSecurity.IsElevated)
+        {
+            if (!quiet) MessageBox.Show(ProcessSecurity.ElevatedPerUserOperationMessage, "Restart SpaceLens normally", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         string? current = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(current) || !Path.GetFullPath(current).Equals(Path.GetFullPath(InstalledExecutable), StringComparison.OrdinalIgnoreCase))
         {
@@ -29,18 +51,25 @@ internal static class InstallerLifecycle
         }
         try
         {
-            string helper = Path.Combine(Path.GetTempPath(), $"SpaceLens-Uninstall-{Guid.NewGuid():N}.exe"); File.Copy(current, helper, true);
-            var start = new ProcessStartInfo(helper) { UseShellExecute = false }; start.ArgumentList.Add("--uninstall-helper"); start.ArgumentList.Add(Environment.ProcessId.ToString()); start.ArgumentList.Add(removeCache ? "1" : "0"); start.ArgumentList.Add(quiet ? "1" : "0"); Process.Start(start);
+            string helper = Path.Combine(Path.GetTempPath(), $"SpaceLens-Uninstall-{Guid.NewGuid():N}.exe"); File.Copy(current, helper, false);
+            using FileStream helperLock = OpenVerifiedHelperCopy(current, helper);
+            var start = new ProcessStartInfo(helper) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(helper)! }; start.ArgumentList.Add("--uninstall-helper"); start.ArgumentList.Add(Environment.ProcessId.ToString()); start.ArgumentList.Add(removeCache ? "1" : "0"); start.ArgumentList.Add(quiet ? "1" : "0");
+            using Process? process = Process.Start(start);
+            if (process is null) throw new InvalidOperationException("Windows could not start the uninstaller.");
         }
         catch (Exception ex) { if (!quiet) MessageBox.Show($"Could not start the uninstaller.\n\n{ex.Message}", "Uninstall failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
     internal static void RunUninstallHelper(string[] args)
     {
-        bool quiet = args.Length > 3 && args[3] == "1"; bool removeCache = args.Length > 2 && args[2] == "1";
+        bool quiet = args.Length == 4 && args[3] == "1"; bool removeCache = args.Length == 4 && args[2] == "1";
         try
         {
-            if (args.Length > 1 && int.TryParse(args[1], out int processId)) try { Process.GetProcessById(processId).WaitForExit(15000); } catch { }
+            if (ProcessSecurity.IsElevated) throw new SecurityException(ProcessSecurity.ElevatedPerUserOperationMessage);
+            if (args.Length != 4 || args[0] != "--uninstall-helper" || !int.TryParse(args[1], out int processId) || processId <= 0 || args[2] is not ("0" or "1") || args[3] is not ("0" or "1")) throw new InvalidDataException("The uninstall helper arguments are invalid.");
+            string self = Environment.ProcessPath ?? throw new InvalidOperationException("The uninstall helper path is unavailable.");
+            if (!IsOwnedTemporaryExecutable(self, "SpaceLens-Uninstall-")) throw new SecurityException("The uninstall helper is not running from its owned temporary path.");
+            try { using Process parent = Process.GetProcessById(processId); parent.WaitForExit(15000); } catch { }
             string expected = Path.GetFullPath(InstallDirectory).TrimEnd(Path.DirectorySeparatorChar); string executable = Path.GetFullPath(InstalledExecutable);
             if (!executable.StartsWith(expected + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("The install path failed safety validation.");
             TryDeleteFile(DesktopShortcut); TryDeleteFile(StartMenuShortcut); TryDeleteDirectoryIfEmpty(StartMenuDirectory);
@@ -57,6 +86,9 @@ internal static class InstallerLifecycle
     {
         actual = Path.GetFullPath(actual).TrimEnd(Path.DirectorySeparatorChar); expected = Path.GetFullPath(expected).TrimEnd(Path.DirectorySeparatorChar);
         if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Refused to remove an unexpected directory.");
+        if (!Directory.Exists(actual)) return;
+        if ((File.GetAttributes(actual) & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Refused to recursively remove a linked directory.");
+        if (!NativeResolvedPath.TryResolveDirectory(actual, out string resolved, out _) || !Path.GetFullPath(resolved).TrimEnd(Path.DirectorySeparatorChar).Equals(actual, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Refused to remove a directory whose filesystem target changed.");
         for (int attempt = 0; attempt < 5; attempt++) { try { if (Directory.Exists(actual)) Directory.Delete(actual, true); return; } catch (IOException) when (attempt < 4) { Thread.Sleep(350); } catch (UnauthorizedAccessException) when (attempt < 4) { Thread.Sleep(350); } }
     }
     private static void TryDeleteFile(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
@@ -65,13 +97,60 @@ internal static class InstallerLifecycle
     {
         try
         {
-            string full = Path.GetFullPath(self), temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar); string name = Path.GetFileName(full);
-            if (!Path.GetDirectoryName(full)!.Equals(temp, StringComparison.OrdinalIgnoreCase) || !name.StartsWith("SpaceLens-Uninstall-", StringComparison.Ordinal) || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
-            string script = Path.Combine(temp, $"SpaceLens-Cleanup-{Guid.NewGuid():N}.cmd");
-            File.WriteAllText(script, $"@echo off\r\nfor /L %%i in (1,1,20) do (\r\n  del /f /q \"{full}\" >nul 2>&1\r\n  if not exist \"{full}\" goto done\r\n  ping 127.0.0.1 -n 2 >nul\r\n)\r\n:done\r\ndel /f /q \"%~f0\"\r\n");
-            var start = new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden }; start.ArgumentList.Add("/d"); start.ArgumentList.Add("/c"); start.ArgumentList.Add(script); Process.Start(start);
+            string full = Path.GetFullPath(self);
+            if (!IsOwnedTemporaryExecutable(full, "SpaceLens-Uninstall-")) return;
+            string powershell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+            if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell is unavailable.", powershell);
+            var start = new ProcessStartInfo(powershell) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
+            start.ArgumentList.Add("-NoLogo"); start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-NonInteractive"); start.ArgumentList.Add("-WindowStyle"); start.ArgumentList.Add("Hidden"); start.ArgumentList.Add("-Command");
+            start.ArgumentList.Add("$p=$env:SPACELENS_SELF_DELETE_TARGET; for($i=0;$i -lt 20 -and (Test-Path -LiteralPath $p);$i++){ Start-Sleep -Milliseconds 500; Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }");
+            start.Environment["SPACELENS_SELF_DELETE_TARGET"] = full;
+            using Process? process = Process.Start(start);
+            if (process is null) throw new InvalidOperationException("Windows could not schedule uninstall-helper cleanup.");
         }
         catch { MoveFileEx(self, null, 4); }
+    }
+
+    private static FileStream OpenVerifiedHelperCopy(string sourcePath, string helperPath)
+    {
+        byte[] expected;
+        using (var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 1024 * 1024, FileOptions.SequentialScan)) expected = SHA256.HashData(source);
+        FileStream? helper = null;
+        try
+        {
+            helper = new FileStream(helperPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
+            byte[] actual = SHA256.HashData(helper);
+            if (!CryptographicOperations.FixedTimeEquals(expected, actual)) throw new CryptographicException("The temporary uninstall helper does not match the running SpaceLens executable.");
+            helper.Position = 0; FileStream verified = helper; helper = null; return verified;
+        }
+        finally { helper?.Dispose(); }
+    }
+
+    private static bool IsOwnedTemporaryExecutable(string path, string prefix)
+    {
+        string full; try { full = Path.GetFullPath(path); } catch { return false; }
+        string temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (!string.Equals(Path.GetDirectoryName(full)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), temp, StringComparison.OrdinalIgnoreCase)) return false;
+        string name = Path.GetFileName(full);
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return false;
+        string token = name[prefix.Length..^4];
+        return token.Length == 32 && token.All(Uri.IsHexDigit);
+    }
+
+    internal static void RunSecuritySelfTest()
+    {
+        string temp = Path.GetFullPath(Path.GetTempPath());
+        string valid = Path.Combine(temp, "SpaceLens-Uninstall-0123456789abcdef0123456789abcdef.exe");
+        if (!IsOwnedTemporaryExecutable(valid, "SpaceLens-Uninstall-")
+            || IsOwnedTemporaryExecutable(Path.Combine(temp, "SpaceLens-Uninstall-not-a-guid.exe"), "SpaceLens-Uninstall-")
+            || IsOwnedTemporaryExecutable(Path.Combine(temp, "SpaceLens-Setup-0123456789abcdef0123456789abcdef.exe"), "SpaceLens-Uninstall-")
+            || IsOwnedTemporaryExecutable(Path.Combine(temp, "nested", Path.GetFileName(valid)), "SpaceLens-Uninstall-"))
+            throw new InvalidOperationException("Uninstall helper path policy self-test failed.");
+
+        bool mismatchRejected = false;
+        try { DeleteValidatedDirectory(Path.Combine(temp, "SpaceLens-delete-a"), Path.Combine(temp, "SpaceLens-delete-b")); }
+        catch (InvalidOperationException) { mismatchRejected = true; }
+        if (!mismatchRejected) throw new InvalidOperationException("Uninstall directory safety self-test failed.");
     }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool MoveFileEx(string existingFileName, string? newFileName, int flags);
 }

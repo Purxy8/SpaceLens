@@ -13,6 +13,9 @@ namespace DesktopOrganizer;
 internal static class FastFileScanner
 {
     private const int ReportBatchSize = 8_000;
+    private const int MaximumQueuedDirectories = 250_000;
+    private const int MaximumTraversedDirectories = 1_000_000;
+    private const long MaximumDirectoryPathCharacters = 128L * 1024 * 1024;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
     private const uint CloudTagMask = 0xFFFF0FFF;
@@ -71,6 +74,7 @@ internal static class FastFileScanner
         if (!NativeResolvedPath.TryResolveDirectory(fullRoot, out fullRoot, out _)) return 1;
 
         var pending = new Stack<PendingDirectory>();
+        var traversalBudget = new TraversalBudget();
         var visitedDirectories = new HashSet<NativeFileId>();
         var countedFiles = new HashSet<NativeFileId>();
         var batch = new List<FileItem>(ReportBatchSize);
@@ -82,9 +86,9 @@ internal static class FastFileScanner
         {
             rootVolume = rootIdentity.Id.VolumeSerial;
             if (rootIdentity.Id.FileIndex != 0) visitedDirectories.Add(rootIdentity.Id);
-            pending.Push(new(fullRoot, rootIdentity.Id));
+            traversalBudget.Queue(pending, new(fullRoot, rootIdentity.Id));
         }
-        else pending.Push(new(fullRoot, default));
+        else traversalBudget.Queue(pending, new(fullRoot, default));
 
         using var native = new NativeDirectoryEnumerator();
         try
@@ -100,7 +104,7 @@ internal static class FastFileScanner
                     rootVolume,
                     wholeVolumeRoot,
                     token,
-                    (directory, entry) => ProcessNativeEntry(directory, entry, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, ref batch, ref skipped, progress, strictReparseDirectories),
+                    (directory, entry) => ProcessNativeEntry(directory, entry, fullRoot, rootVolume, pending, traversalBudget, visitedDirectories, countedFiles, ref batch, ref skipped, progress, strictReparseDirectories),
                     out string validatedDirectory);
 
                 if (result == NativeEnumerationResult.UnsupportedBeforeFirstEntry)
@@ -114,7 +118,7 @@ internal static class FastFileScanner
                             || !NativeFileIdentity.TryGet(fallbackPath, true, out NativeFileInformation fallbackIdentity)
                             || (queued.ExpectedId.FileIndex != 0 && fallbackIdentity.Id != queued.ExpectedId)
                             || (rootVolume != 0 && fallbackIdentity.Id.VolumeSerial != rootVolume)) skipped++;
-                        else EnumerateManaged(fallbackPath, fullRoot, rootVolume, pending, visitedDirectories, countedFiles, ref batch, ref skipped, progress, token, false);
+                        else EnumerateManaged(fallbackPath, fullRoot, rootVolume, pending, traversalBudget, visitedDirectories, countedFiles, ref batch, ref skipped, progress, token, false);
                     }
                 }
                 else if (result == NativeEnumerationResult.Failed)
@@ -124,6 +128,11 @@ internal static class FastFileScanner
                     skipped++;
                 }
             }
+        }
+        catch (DirectoryTraversalLimitException)
+        {
+            if (batch.Count > 0) progress.Report((batch, skipped));
+            throw;
         }
         catch (OperationCanceledException)
         {
@@ -141,6 +150,7 @@ internal static class FastFileScanner
         string scanRoot,
         uint rootVolume,
         Stack<PendingDirectory> pending,
+        TraversalBudget traversalBudget,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
         ref List<FileItem> batch,
@@ -176,7 +186,7 @@ internal static class FastFileScanner
                 id = resolvedIdentity.Id;
             }
             if (id.FileIndex != 0 && !visitedDirectories.Add(id)) { skipped++; return; }
-            pending.Push(new(path, id));
+            traversalBudget.Queue(pending, new(path, id));
             return;
         }
 
@@ -215,6 +225,7 @@ internal static class FastFileScanner
         string scanRoot,
         uint rootVolume,
         Stack<PendingDirectory> pending,
+        TraversalBudget traversalBudget,
         HashSet<NativeFileId> visitedDirectories,
         HashSet<NativeFileId> countedFiles,
         ref List<FileItem> batch,
@@ -246,12 +257,15 @@ internal static class FastFileScanner
                         childId = identity.Id;
                     }
                     else if (reparse) { skipped++; continue; }
-                    pending.Push(new(candidate, childId));
+                    traversalBudget.Queue(pending, new(candidate, childId));
                 }
-                catch { skipped++; }
+                catch (DirectoryTraversalLimitException) { throw; }
+                catch (Exception ex) when (IsExpectedFileSystemFailure(ex)) { skipped++; }
             }
         }
-        catch { skipped++; }
+        catch (OperationCanceledException) { throw; }
+        catch (DirectoryTraversalLimitException) { throw; }
+        catch (Exception ex) when (IsExpectedFileSystemFailure(ex)) { skipped++; }
 
         try
         {
@@ -282,11 +296,33 @@ internal static class FastFileScanner
                     if (hasIdentity && !countedFiles.Add(identity.Id)) item = item with { DiskBytes = 0, AllocationEstimated = false };
                     batch.Add(item);
                 }
-                catch { skipped++; }
+                catch (Exception ex) when (IsExpectedFileSystemFailure(ex)) { skipped++; }
                 FlushIfFull(ref batch, skipped, progress);
             }
         }
-        catch { skipped++; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (IsExpectedFileSystemFailure(ex)) { skipped++; }
+    }
+
+    private static bool IsExpectedFileSystemFailure(Exception ex)
+        => ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or System.Security.SecurityException or OverflowException;
+
+    internal static bool ManagedCancellationPropagatesForTest(string directory)
+    {
+        string fullRoot = Path.GetFullPath(directory);
+        uint rootVolume = NativeFileIdentity.TryGet(fullRoot, true, out NativeFileInformation rootIdentity) ? rootIdentity.Id.VolumeSerial : 0;
+        var pending = new Stack<PendingDirectory>();
+        var traversalBudget = new TraversalBudget();
+        var visitedDirectories = new HashSet<NativeFileId>();
+        var countedFiles = new HashSet<NativeFileId>();
+        var batch = new List<FileItem>();
+        int skipped = 0;
+        try
+        {
+            EnumerateManaged(fullRoot, fullRoot, rootVolume, pending, traversalBudget, visitedDirectories, countedFiles, ref batch, ref skipped, new Progress<(List<FileItem>, int)>(), new CancellationToken(canceled: true), false);
+            return false;
+        }
+        catch (OperationCanceledException) { return true; }
     }
 
     private static bool IsCloudDirectory(string path)
@@ -349,6 +385,41 @@ internal static class FastFileScanner
     }
 
     private readonly record struct PendingDirectory(string Path, NativeFileId ExpectedId);
+
+    private sealed class TraversalBudget
+    {
+        private int traversedDirectories;
+        private long directoryPathCharacters;
+
+        internal void Queue(Stack<PendingDirectory> pending, PendingDirectory directory)
+        {
+            long nextPathCharacters;
+            try { nextPathCharacters = checked(directoryPathCharacters + directory.Path.Length); }
+            catch (OverflowException) { throw new DirectoryTraversalLimitException(); }
+            ThrowIfDirectoryBudgetExceeded(traversedDirectories, pending.Count, nextPathCharacters);
+            pending.Push(directory);
+            traversedDirectories++;
+            directoryPathCharacters = nextPathCharacters;
+        }
+    }
+
+    private sealed class DirectoryTraversalLimitException : IOException
+    {
+        internal DirectoryTraversalLimitException()
+            : base($"The selected location exceeds the safe traversal budget ({MaximumTraversedDirectories:N0} directories, {MaximumQueuedDirectories:N0} queued directories, or {MaximumDirectoryPathCharacters:N0} path characters). The scan stopped to protect application memory.") { }
+    }
+
+    private static void ThrowIfDirectoryBudgetExceeded(int traversedDirectories, int queuedDirectories, long directoryPathCharacters)
+    {
+        if (traversedDirectories < 0 || queuedDirectories < 0 || directoryPathCharacters < 0 || traversedDirectories >= MaximumTraversedDirectories || queuedDirectories >= MaximumQueuedDirectories || directoryPathCharacters > MaximumDirectoryPathCharacters)
+            throw new DirectoryTraversalLimitException();
+    }
+
+    internal static bool DirectoryBudgetAcceptsForTest(int traversedDirectories, int queuedDirectories, long directoryPathCharacters)
+    {
+        try { ThrowIfDirectoryBudgetExceeded(traversedDirectories, queuedDirectories, directoryPathCharacters); return true; }
+        catch (DirectoryTraversalLimitException) { return false; }
+    }
 
     private readonly record struct NativeDirectoryEntry(
         string Name,

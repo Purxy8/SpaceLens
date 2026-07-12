@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory)][string]$SignedArtifactZip,
     [Parameter(Mandatory)][ValidatePattern('^(sha256:)?[0-9A-Fa-f]{64}$')][string]$ExpectedArtifactDigest,
     [Parameter(Mandatory)][ValidatePattern('^[1-9][0-9]*$')][string]$ExpectedWorkflowRunId,
-    [Parameter(Mandatory)][string]$SigningKey,
+    [Parameter(Mandatory)][string]$ReleaseSigner,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedSignerSha256,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]{1,98}[A-Za-z0-9]$')][string]$CngKeyName = 'SpaceLens Update Signing v2',
     [ValidateLength(1, 4000)][string]$Notes = 'Includes SpaceLens improvements and fixes.'
 )
 
@@ -14,15 +16,18 @@ $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifacts = [IO.Path]::GetFullPath((Join-Path $repository 'artifacts'))
 $releaseRoot = Join-Path $artifacts 'release'
 $propertiesPath = Join-Path $repository 'Directory.Build.props'
-$signerProject = Join-Path $repository 'tools\ReleaseSigner\ReleaseSigner.csproj'
 $publicKey = Join-Path $repository 'src\SpaceLens\assets\update-public-key.pem'
+$securityModule = Join-Path $PSScriptRoot 'ReleaseSecurity.psm1'
 
-foreach ($required in @($propertiesPath, $signerProject, $publicKey, $SigningKey)) {
+foreach ($required in @($propertiesPath, $publicKey, $securityModule, $ReleaseSigner)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required file is missing: $required" }
 }
 if (-not (Test-Path -LiteralPath $SignedArtifactZip -PathType Leaf)) { throw "Signed artifact ZIP is missing: $SignedArtifactZip" }
-if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'The .NET 10 SDK is required and dotnet was not found on PATH.' }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required to verify signed build provenance.' }
+Import-Module $securityModule -Force
+Assert-PublicSpkiPemFile -Path $publicKey | Out-Null
+$resolvedKey = $CngKeyName
+$signerMode = 'sign-release-cng'
 
 [xml]$properties = Get-Content -Raw -LiteralPath $propertiesPath
 $versionNodes = @($properties.SelectNodes('/Project/PropertyGroup/SpaceLensVersion'))
@@ -37,7 +42,7 @@ function Get-OwnedChildPath {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Parent)
     $fullPath = [IO.Path]::GetFullPath($Path)
     $fullParent = [IO.Path]::GetFullPath($Parent).TrimEnd([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
-    if (-not $fullPath.StartsWith($fullParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to manage a path outside $fullParent`: $fullPath" }
+    if (-not $fullPath.StartsWith($fullParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal)) { throw "Refusing to manage a path outside $fullParent`: $fullPath" }
     return $fullPath
 }
 
@@ -78,6 +83,19 @@ function Write-HashFile {
     return $hash
 }
 
+function Get-FileRecord {
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        return [ordered]@{
+            name = $item.Name
+            sizeBytes = [long]$item.Length
+            sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+        }
+    }
+    throw "Release artifact is not a regular file: $Path"
+}
+
 function Assert-SignPathExecutable {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$OriginalFilename)
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
@@ -90,31 +108,26 @@ function Assert-SignPathExecutable {
     return $signature
 }
 
-function Invoke-PackagedSelfTest {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Description)
-    $process = Start-Process -FilePath $Path -ArgumentList '"--self-test"' -PassThru -WindowStyle Hidden
-    try {
-        if (-not $process.WaitForExit(90000)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; throw "$Description timed out." }
-        $process.Refresh(); $exitCode = $process.ExitCode
-    }
-    finally { $process.Dispose() }
-    if ($exitCode -ne 0) { throw "$Description failed with exit code $exitCode." }
-}
-
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
-$resolvedZip = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $SignedArtifactZip).Path)
-if ((Get-Item -LiteralPath $resolvedZip).Length -gt 500MB) { throw 'The signed GitHub artifact ZIP is unexpectedly large.' }
-$actualArtifactDigest = (Get-FileHash -LiteralPath $resolvedZip -Algorithm SHA256).Hash.ToUpperInvariant()
+Assert-ReleasePathHasNoReparsePoints -Path $artifacts -StopAt $repository
 $normalizedExpectedDigest = if ($ExpectedArtifactDigest.StartsWith('sha256:', [StringComparison]::OrdinalIgnoreCase)) { $ExpectedArtifactDigest.Substring(7).ToUpperInvariant() } else { $ExpectedArtifactDigest.ToUpperInvariant() }
-if (-not [string]::Equals($actualArtifactDigest, $normalizedExpectedDigest, [StringComparison]::Ordinal)) { throw 'The downloaded artifact does not match the SHA-256 shown in the trusted GitHub workflow summary.' }
 
 $resolvedInput = Get-OwnedChildPath -Path (Join-Path $artifacts ('.signpath-input-' + [Guid]::NewGuid().ToString('N'))) -Parent $artifacts
+$signerLock = $null
+$zipLock = $null
 New-Item -ItemType Directory -Path $resolvedInput | Out-Null
+Assert-ReleasePathHasNoReparsePoints -Path $resolvedInput -StopAt $repository
 $inputNames = @('SpaceLens.exe', 'SpaceLens.exe.sha256', 'SpaceLens-Setup.exe', 'SpaceLens-Setup.exe.sha256', 'release-metadata.json')
 try {
+    $zipLock = Open-VerifiedReleaseFile -Path $SignedArtifactZip -ExpectedSha256 $normalizedExpectedDigest
+    if ($zipLock.Stream.Length -le 0 -or $zipLock.Stream.Length -gt 500MB) { throw 'The signed GitHub artifact ZIP is empty or unexpectedly large.' }
+    $resolvedZip = $zipLock.FullPath
+    $actualArtifactDigest = $zipLock.Sha256
+
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $archive = [IO.Compression.ZipFile]::OpenRead($resolvedZip)
+    $zipLock.Stream.Position = 0
+    $archive = [IO.Compression.ZipArchive]::new($zipLock.Stream, [IO.Compression.ZipArchiveMode]::Read, $true)
     try {
     $entries = @($archive.Entries)
     if ($entries.Count -ne $inputNames.Count) { throw 'The signed GitHub artifact ZIP has an unexpected entry count.' }
@@ -128,10 +141,10 @@ try {
     }
     $difference = @(Compare-Object -ReferenceObject @($inputNames | Sort-Object) -DifferenceObject @($entries.Name | Sort-Object) -CaseSensitive)
     if ($difference.Count -ne 0) { throw "The signed GitHub artifact ZIP has unexpected files: $($difference | Out-String)" }
+    $remainingExtractionBytes = 600MB
     foreach ($entry in $entries) {
         $destination = Get-OwnedChildPath -Path (Join-Path $resolvedInput $entry.Name) -Parent $resolvedInput
-        $source = $entry.Open(); $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $source.CopyTo($output); $output.Flush($true) } finally { $output.Dispose(); $source.Dispose() }
+        Copy-ReleaseZipEntryExact -Entry $entry -Destination $destination -MaximumEntryBytes 300MB -RemainingTotalBytes ([ref]$remainingExtractionBytes)
     }
     }
     finally { $archive.Dispose() }
@@ -169,20 +182,25 @@ if ($LASTEXITCODE -ne 0 -or $changes.Count -ne 0) { throw "Finalization requires
 $sourceCommit = (& git -c $gitSafety -C $repository rev-parse HEAD).Trim().ToLowerInvariant()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $metadata.sourceCommit) { throw 'The local source commit does not match the GitHub workflow that produced the signed artifacts.' }
 
-Invoke-PackagedSelfTest -Path $inputApp -Description 'Signed SpaceLens self-test'
-Invoke-PackagedSelfTest -Path $inputSetup -Description 'Signed SpaceLens Setup self-test'
-$postTestAppHash = Assert-HashFile -Path $inputApp
-$postTestSetupHash = Assert-HashFile -Path $inputSetup
-if ($postTestAppHash -ne $appHash -or $postTestSetupHash -ne $setupHash) { throw 'A signed executable changed while its packaged self-test was running.' }
+# Build tools and all release-binary executions are completed before the private
+# key is opened. The final signer call below signs and verifies in one process.
+$signerExecutable = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ReleaseSigner).Path)
+if (-not (Test-Path -LiteralPath $signerExecutable -PathType Leaf)) { throw 'ReleaseSigner executable is missing.' }
+Assert-NativeReleaseSignerDirectory -ExecutablePath $signerExecutable
+$signerLock = Open-VerifiedReleaseExecutable -Path $signerExecutable -ExpectedSha256 $ExpectedSignerSha256
+Invoke-LockedReleaseSigner -Lock $signerLock -Arguments @('self-test')
 $appSignature = Assert-SignPathExecutable -Path $inputApp -OriginalFilename 'SpaceLens.dll'
 $setupSignature = Assert-SignPathExecutable -Path $inputSetup -OriginalFilename 'SpaceLens-Setup.dll'
 
 New-Item -ItemType Directory -Path $artifacts, $releaseRoot -Force | Out-Null
+Assert-ReleasePathHasNoReparsePoints -Path $artifacts -StopAt $repository
+Assert-ReleasePathHasNoReparsePoints -Path $releaseRoot -StopAt $repository
 $staging = Get-OwnedChildPath -Path (Join-Path $releaseRoot (".$version-" + [Guid]::NewGuid().ToString('N') + '.staging')) -Parent $releaseRoot
 $releaseDirectory = Get-OwnedChildPath -Path (Join-Path $releaseRoot $version) -Parent $releaseRoot
 $previous = ''
 try {
     New-Item -ItemType Directory -Path $staging | Out-Null
+    Assert-ReleasePathHasNoReparsePoints -Path $staging -StopAt $repository
     $app = Join-Path $staging 'SpaceLens.exe'; $setup = Join-Path $staging 'SpaceLens-Setup.exe'
     Copy-Item -LiteralPath $inputApp -Destination $app
     Copy-Item -LiteralPath $inputSetup -Destination $setup
@@ -199,32 +217,57 @@ try {
         sizeBytes = (Get-Item -LiteralPath $setup).Length; publishedUtc = (Get-Date).ToUniversalTime().ToString('O'); notes = $Notes; signature = ''
     }
     [IO.File]::WriteAllText($unsignedManifest, (($manifest | ConvertTo-Json) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
-    & dotnet run --project $signerProject -c Release -- sign ([IO.Path]::GetFullPath($SigningKey)) $unsignedManifest $signedManifest
-    if ($LASTEXITCODE -ne 0) { throw 'ReleaseSigner could not sign update.json.' }
-    & dotnet run --project $signerProject -c Release -- verify $publicKey $signedManifest
-    if ($LASTEXITCODE -ne 0) { throw 'ReleaseSigner could not verify update.json.' }
-    Invoke-PackagedSelfTest -Path $app -Description 'Final SpaceLens self-test'
-    Invoke-PackagedSelfTest -Path $setup -Description 'Final SpaceLens Setup self-test'
-    $verify = Start-Process -FilePath $app -ArgumentList ('"--verify-update-manifest" "' + $signedManifest + '" "--installer" "' + $setup + '"') -PassThru -WindowStyle Hidden
-    try { if (-not $verify.WaitForExit(90000)) { Stop-Process -Id $verify.Id -Force -ErrorAction SilentlyContinue; throw 'Production update verification timed out.' }; $verify.Refresh(); if ($verify.ExitCode -ne 0) { throw "Production update verification failed with exit code $($verify.ExitCode)." } } finally { $verify.Dispose() }
+    # SECURITY BOUNDARY: this is the only operation that opens the private key.
+    # No application, Setup, build tool, Git command, or other produced
+    # executable is run after this process returns.
+    Invoke-LockedReleaseSigner -Lock $signerLock -Arguments @($signerMode, $resolvedKey, $publicKey, $unsignedManifest, $signedManifest)
+    Assert-SignedUpdateManifest -PublicKey $publicKey -Manifest $signedManifest -ExpectedVersion $version -ExpectedSetupSha256 $setupHash -ExpectedSetupSize (Get-Item -LiteralPath $setup).Length
     $finalAppHash = Assert-HashFile -Path $app; $finalSetupHash = Assert-HashFile -Path $setup
     if ($finalAppHash -ne $appHash -or $finalSetupHash -ne $setupHash) { throw 'A signed executable changed during final verification.' }
     [void](Assert-SignPathExecutable -Path $app -OriginalFilename 'SpaceLens.dll')
     [void](Assert-SignPathExecutable -Path $setup -OriginalFilename 'SpaceLens-Setup.dll')
-    & dotnet run --project $signerProject -c Release -- verify $publicKey $signedManifest
-    if ($LASTEXITCODE -ne 0) { throw 'The final update.json no longer passes ReleaseSigner verification.' }
     Remove-Item -LiteralPath $unsignedManifest -Force
 
-    Assert-DirectoryContainsOnly -Directory $staging -Names @('RELEASE-NOTES.md', 'SpaceLens.exe', 'SpaceLens.exe.sha256', 'SpaceLens-Setup.exe', 'SpaceLens-Setup.exe.sha256', 'update.json')
+    $releaseProvenance = [ordered]@{
+        schemaVersion = 1
+        product = 'SpaceLens'
+        version = $version
+        sourceRepository = [string]$metadata.sourceRepository
+        sourceCommit = [string]$metadata.sourceCommit
+        sourceRef = [string]$metadata.sourceRef
+        workflowRunId = [string]$metadata.workflowRunId
+        signPathArtifactSha256 = $actualArtifactDigest
+        signingRequests = $metadata.signingRequests
+        releaseArtifacts = @(
+            Get-FileRecord -Path (Join-Path $staging 'RELEASE-NOTES.md')
+            Get-FileRecord -Path $app
+            Get-FileRecord -Path "$app.sha256"
+            Get-FileRecord -Path $setup
+            Get-FileRecord -Path "$setup.sha256"
+            Get-FileRecord -Path $signedManifest
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $staging 'release-provenance.json'),
+        (($releaseProvenance | ConvertTo-Json -Depth 6) + [Environment]::NewLine),
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    Assert-DirectoryContainsOnly -Directory $staging -Names @('RELEASE-NOTES.md', 'SpaceLens.exe', 'SpaceLens.exe.sha256', 'SpaceLens-Setup.exe', 'SpaceLens-Setup.exe.sha256', 'update.json', 'release-provenance.json')
     if (Test-Path -LiteralPath $releaseDirectory) {
         $resolvedRelease = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $releaseDirectory).Path)
         [void](Get-OwnedChildPath -Path $resolvedRelease -Parent $releaseRoot)
+        Assert-ReleasePathHasNoReparsePoints -Path $resolvedRelease -StopAt $repository
+        Assert-ReleaseTreeHasNoReparsePoints -Path $resolvedRelease
         $previous = Get-OwnedChildPath -Path (Join-Path $releaseRoot (".$version-" + [Guid]::NewGuid().ToString('N') + '.previous')) -Parent $releaseRoot
         Move-Item -LiteralPath $resolvedRelease -Destination $previous
+        Assert-ReleasePathHasNoReparsePoints -Path $previous -StopAt $repository
     }
     try {
         [void](Get-OwnedChildPath -Path $staging -Parent $releaseRoot); [void](Get-OwnedChildPath -Path $releaseDirectory -Parent $releaseRoot)
+        Assert-ReleasePathHasNoReparsePoints -Path $staging -StopAt $repository
         Move-Item -LiteralPath $staging -Destination $releaseDirectory
+        Assert-ReleasePathHasNoReparsePoints -Path $releaseDirectory -StopAt $repository
     }
     catch {
         if ($previous -and (Test-Path -LiteralPath $previous) -and -not (Test-Path -LiteralPath $releaseDirectory)) { [void](Get-OwnedChildPath -Path $previous -Parent $releaseRoot); Move-Item -LiteralPath $previous -Destination $releaseDirectory }
@@ -233,7 +276,7 @@ try {
     if ($previous -and (Test-Path -LiteralPath $previous)) {
         $resolvedPrevious = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $previous).Path)
         [void](Get-OwnedChildPath -Path $resolvedPrevious -Parent $releaseRoot)
-        try { Assert-NoReparsePointTree -Path $resolvedPrevious; Remove-Item -LiteralPath $resolvedPrevious -Recurse -Force }
+        try { Assert-ReleasePathHasNoReparsePoints -Path $resolvedPrevious -StopAt $repository; Assert-ReleaseTreeHasNoReparsePoints -Path $resolvedPrevious; Remove-Item -LiteralPath $resolvedPrevious -Recurse -Force }
         catch { Write-Warning "The new release is valid and committed, but the previous backup could not be fully removed: $resolvedPrevious" }
     }
 }
@@ -241,17 +284,23 @@ finally {
     if (Test-Path -LiteralPath $staging) {
         $resolvedStaging = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $staging).Path)
         [void](Get-OwnedChildPath -Path $resolvedStaging -Parent $releaseRoot)
-        Assert-NoReparsePointTree -Path $resolvedStaging
+        Assert-ReleasePathHasNoReparsePoints -Path $resolvedStaging -StopAt $repository
+        Assert-ReleaseTreeHasNoReparsePoints -Path $resolvedStaging
         Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
     }
 }
 }
 finally {
-    if (Test-Path -LiteralPath $resolvedInput) {
-        $resolvedInputCleanup = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $resolvedInput).Path)
-        [void](Get-OwnedChildPath -Path $resolvedInputCleanup -Parent $artifacts)
-        Assert-NoReparsePointTree -Path $resolvedInputCleanup
-        Remove-Item -LiteralPath $resolvedInputCleanup -Recurse -Force
+    if ($null -ne $signerLock) { $signerLock.Stream.Dispose() }
+    if ($null -ne $zipLock) { $zipLock.Stream.Dispose() }
+    foreach ($cleanupDirectory in @($resolvedInput)) {
+        if (Test-Path -LiteralPath $cleanupDirectory) {
+            $resolvedCleanup = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $cleanupDirectory).Path)
+            [void](Get-OwnedChildPath -Path $resolvedCleanup -Parent $artifacts)
+            Assert-ReleasePathHasNoReparsePoints -Path $resolvedCleanup -StopAt $repository
+            Assert-ReleaseTreeHasNoReparsePoints -Path $resolvedCleanup
+            Remove-Item -LiteralPath $resolvedCleanup -Recurse -Force
+        }
     }
 }
 

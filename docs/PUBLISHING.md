@@ -1,93 +1,97 @@
 # Publishing SpaceLens
 
-## Prerequisites
+## Security prerequisites
 
-- Windows with the .NET 10 SDK and PowerShell 7
-- Git available on `PATH`
-- Write access to `Purxy8/SpaceLens`
-- The offline ECDSA P-256 private update-signing key
-- For an Authenticode release: an approved SignPath Foundation project, the SignPath GitHub App, a least-privilege submitter token, and the configured repository variables described below
+- Windows, PowerShell 7, Git, and the pinned .NET 10 SDK
+- A clean committed checkout of the exact release source
+- A normal, unelevated, interactive maintainer account
+- A non-exportable, high-protection Windows CNG ECDSA P-256 key
 
-Never commit or upload the private ECDSA key. The public verification key in `src/SpaceLens/assets/update-public-key.pem` is intentionally tracked.
+Never create or upload exportable private key material. The release tools hard-fail standalone/private-PEM key commands. Only the public verification key is tracked.
 
-## Prepare a version
+## One-time 1.6.1 trust reset
 
-1. Choose a strict `MAJOR.MINOR.PATCH` version.
-2. Update `SpaceLensVersion` in `Directory.Build.props`; application, Setup, and file versions inherit it.
-3. Add `release-notes/vVERSION.md` and update `CHANGELOG.md`.
-4. Commit the intended source and confirm `git status --short` is empty.
-5. Run the build with the offline key:
+The previous development key is retired. Version 1.6.1 must not be published until the maintainer completes this handoff. Existing clients cannot securely authenticate a replacement key using the old trust anchor, so users of 1.6.0 or earlier must install 1.6.1 manually from the official release.
+
+From the reviewed clean commit, build the NativeAOT signer to an otherwise empty external directory and record its SHA-256 through a separate trusted channel:
+
+```powershell
+dotnet publish .\tools\ReleaseSigner\ReleaseSigner.csproj `
+  -c Release -r win-x64 --self-contained true -p:PublishAot=true `
+  -p:DebugSymbols=false -o 'E:\trusted-tools\SpaceLens-1.6.1-signer'
+
+$signer = 'E:\trusted-tools\SpaceLens-1.6.1-signer\ReleaseSigner.exe'
+Get-FileHash -Algorithm SHA256 $signer
+
+pwsh -File .\scripts\Rotate-UpdateTrust.ps1 `
+  -ReleaseSigner $signer `
+  -ExpectedSignerSha256 'SHA256_COPIED_SEPARATELY' `
+  -CngKeyName 'SpaceLens Update Signing v2'
+```
+
+The signer directory must contain exactly `ReleaseSigner.exe`: no DLL, PDB, sidecar, runtimeconfig, deps file, `.local`, directory, or reparse point. The rotation script hashes and no-write/no-delete locks that exact native file, rejects agent/runner/service/elevated identities, creates the non-exportable key with explicit consent required on private-key use, signs and verifies a fresh `9.9.9` fixture, and transactionally replaces only:
+
+- `src/SpaceLens/assets/update-public-key.pem`
+- `src/SpaceLens/assets/update-selftest.json`
+
+No executable runs after the rotation process exits. Review that exactly those two files changed, run the complete build/self-tests, and commit them. If the CNG key is lost, another manually bootstrapped trust reset is required.
+
+## Build and seal release inputs
+
+1. Update `SpaceLensVersion` in `Directory.Build.props`.
+2. Update `CHANGELOG.md` and add `release-notes/vVERSION.md`.
+3. Commit and confirm `git status --short` is empty.
+4. Build without any private-key access:
 
 ```powershell
 pwsh -File .\scripts\Build-Release.ps1 `
-  -SigningKey 'D:\secure\spacelens-update-private.pem' `
+  -PrepareOfflineRelease `
   -Notes 'Short update text displayed inside SpaceLens.'
 ```
 
-The script reads the version from `Directory.Build.props`. `-Version` remains available as a guard for automation, but a supplied value must match that file exactly. Signed builds refuse a dirty or uncommitted source tree and report the exact Git commit used.
+This phase publishes and self-tests SpaceLens and Setup, runs the harmless startup-hook rejection probe, builds/self-tests the NativeAOT signer, and records exact file hashes plus the source commit. It produces:
 
-The script publishes self-contained x64 builds, runs both packaged GUI self-tests and checks their process exit codes, calculates hashes, creates and ECDSA-signs the update manifest, and verifies the signature with the tracked public key. It then invokes the packaged SpaceLens production verifier against the signed manifest and exact Setup binary. Only after every check succeeds does it create `artifacts/release/VERSION/`, containing exactly the six normal release assets. These locally built executables are still **not Authenticode-signed**, even when the update manifest is ECDSA-signed, and must not be uploaded for a SignPath release. Unsigned CI/local runs stop after verified packaging in `artifacts/intermediate/` and do not create a final release directory.
+- `artifacts/intermediate/SpaceLens-release-input-vVERSION.zip`
+- `artifacts/intermediate/native-release-signer/ReleaseSigner.exe`
+- `artifacts/intermediate/ReleaseSigner.exe.sha256`
 
-Before a release that changes elevated scanning, also publish a temporary local diagnostic build with `-p:SpaceLensEnableDiagnostics=true` and run its `--integration-test-elevated-scan` probe from a medium-integrity shell against a disposable fixed-drive folder. The aggregate JSON report must show an unelevated parent, exactly one Ready event with backup privilege enabled, at least one file batch, and a successful final result. Never upload that diagnostic build; the signed production workflow explicitly forces `SpaceLensEnableDiagnostics=false`.
+Copy the prepared ZIP and native signer to separate external locations. Copy both displayed digests independently; do not trust adjacent sidecars alone.
 
-## SignPath Foundation signing
+SpaceLens 1.6.1 intentionally disables Full access/UAC while a native broker is designed. The historical elevated probe is not applicable. Verify instead that helper entry points reject activation and that normal app, update, cleanup, install, and uninstall flows remain unelevated. Version 1.6.1 never requests UAC; cancel and report any unexpected prompt.
 
-The manual `.github/workflows/sign-release.yml` workflow is deliberately separated from publication. Once enabled, it accepts only a fresh `vVERSION` tag, treated as immutable, whose value matches `Directory.Build.props`, and it uses two manually approved SignPath requests:
+## Offline CNG finalization
 
-1. Build, upload, and Authenticode-sign `SpaceLens.exe` using the `spacelens-app-v1` artifact configuration.
-2. Verify its trusted signature and packaged self-test, then calculate its final hash.
-3. Build Setup with that exact signed application and sidecar embedded.
-4. Upload and Authenticode-sign `SpaceLens-Setup.exe` using the `spacelens-setup-v1` artifact configuration.
-5. Verify Setup's trusted signature and packaged self-test, then upload the signed artifact bundle.
-
-The repository tracks the proposed artifact configurations under `signpath/`. After SignPath onboarding, create these repository settings:
-
-- Secret: `SIGNPATH_API_TOKEN`
-- Variables: `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG`, `SIGNPATH_APP_ARTIFACT_CONFIG`, and `SIGNPATH_SETUP_ARTIFACT_CONFIG`
-
-The workflow is intentionally safety-locked with a literal `if: false` while the SignPath application is pending. Before enabling it, replace **every** `uses:` reference with the audited full commit SHA for that action, record the review in the release change, and only then remove the lock. Never enable mutable action tags for a workflow that receives the SignPath API token.
-
-After onboarding and that security review, commit a clean source tree, create and push a fresh `vVERSION` tag for that commit, and treat it as immutable. Existing tags—including `v1.5.0`—must never be moved or reused. Run the workflow from the GitHub Actions page, select that exact tag, enter `VERSION`, and manually approve both signing requests in SignPath. Download the resulting **unmodified** `SpaceLens-SignPath-vVERSION` ZIP artifact outside the repository, and separately copy its SHA-256 and workflow run ID from the workflow summary. Check out the exact metadata source commit with a clean tree, then finish the release without uploading the offline update key:
+Use a clean checkout of the same source commit. Put the independently authenticated native signer in an otherwise empty directory, then run:
 
 ```powershell
-pwsh -File .\scripts\Finalize-SignPathRelease.ps1 `
-  -SignedArtifactZip 'D:\downloads\SpaceLens-SignPath-vVERSION.zip' `
-  -ExpectedArtifactDigest 'SHA256_FROM_GITHUB_WORKFLOW_SUMMARY' `
-  -ExpectedWorkflowRunId 'GITHUB_WORKFLOW_RUN_ID' `
-  -SigningKey 'D:\secure\spacelens-update-private.pem' `
-  -Notes 'Short update text displayed inside SpaceLens.'
+pwsh -File .\scripts\Finalize-Release.ps1 `
+  -PreparedReleaseZip 'E:\incoming\SpaceLens-release-input-vVERSION.zip' `
+  -ExpectedPreparedDigest 'PREPARED_ZIP_SHA256_COPIED_SEPARATELY' `
+  -ReleaseSigner 'E:\trusted-tools\ReleaseSigner.exe' `
+  -ExpectedSignerSha256 'SIGNER_SHA256_COPIED_SEPARATELY' `
+  -CngKeyName 'SpaceLens Update Signing v2'
 ```
 
-The finalizer first verifies the complete downloaded ZIP against the independently copied GitHub artifact digest. It accepts only the five expected flat files, validates both SignPath Foundation Authenticode signatures and timestamps, PE metadata, sidecar hashes, GitHub repository/run/ref/URL metadata, both signing-request IDs, and the exact clean local source commit. It reruns both packaged self-tests, creates the final hash sidecars, signs `update.json` with the offline ECDSA key, invokes SpaceLens's production update verifier, and atomically creates the normal six-file release directory. Keep both the downloaded ZIP and the private update key outside the repository.
+The finalizer never builds tools and never launches SpaceLens or Setup. Those untrusted product bytes were executed only in the earlier no-key build/CI environment. Finalization performs bounded exact ZIP extraction, verifies source provenance/hashes/sidecars, locks the independently hashed native signer, runs its self-test, signs through CNG, and independently verifies the exact P1363 manifest signature in-process. After CNG access it performs only in-process validation and atomic file operations.
 
-Never store the offline ECDSA update key in GitHub or SignPath. Authenticode identifies the Windows publisher. The ECDSA manifest signature authenticates SpaceLens update metadata. They solve different problems and neither replaces the other.
+The release directory contains exactly seven assets:
 
-## Code-signing order
+- `SpaceLens-Setup.exe`
+- `SpaceLens-Setup.exe.sha256`
+- `SpaceLens.exe`
+- `SpaceLens.exe.sha256`
+- `update.json`
+- `RELEASE-NOTES.md`
+- `release-provenance.json`
 
-Use this order for every Authenticode release:
+## SignPath status
 
-1. Build, upload, and Authenticode-sign `SpaceLens.exe`.
-2. Build Setup with that exact application payload.
-3. Authenticode-sign `SpaceLens-Setup.exe`.
-4. Calculate Setup's final size and SHA-256.
-5. Create and ECDSA-sign `update.json` using those final values.
+No usable SignPath workflow exists for 1.6.1. The previous design mixed execution of repository-built product bytes with later secret access on one runner and was retired. `.github/workflows/sign-release.yml` is an inert literal-false placeholder with no checkout, third-party actions, or secrets.
 
-`Build-Release.ps1` remains the unsigned local/CI build and packaged self-test path. Do not use its unsigned binaries for an Authenticode release; use `sign-release.yml` followed by `Finalize-SignPathRelease.ps1`.
+SignPath approval alone is not permission to enable it. A future implementation requires a separate audit and three fresh jobs: a no-secrets/read-only build and self-test job producing a digest-bound artifact; a fresh secret-only signing job that never executes repository/product code and gives the token only to an immutable-SHA-pinned signing action; and a fresh no-secret validation job. Retained SignPath scripts/configurations are experimental and non-runnable until that design exists.
 
-## Create the GitHub release
+## Publish
 
-1. Create a draft release targeting the already-pushed `vVERSION` tag; do not ask GitHub to create or move the tag.
-2. Use `release-notes/vVERSION.md` as the description.
-3. Upload exactly:
-   - `SpaceLens-Setup.exe`
-   - `SpaceLens-Setup.exe.sha256`
-   - `SpaceLens.exe`
-   - `SpaceLens.exe.sha256`
-   - `update.json`
-   - `RELEASE-NOTES.md`
-4. Verify every checksum and verify `update.json` with `tools/ReleaseSigner`.
-5. Publish the release only after all files are present and correct.
+Create a draft release targeting an already-pushed immutable `vVERSION` tag. Upload the seven files directly from `artifacts/release/VERSION/`, without renaming them. Verify both executable sidecars, independently verify `update.json` against the tracked public key, confirm provenance, then publish.
 
-Upload the six files directly from `artifacts/release/VERSION/`. Do not rename `SpaceLens-Setup.exe`; the updater deliberately rejects other installer names. Release binaries, hashes, and signed manifests belong in GitHub Releases, not in the source tree.
-
-If the private key is lost, a new application build must pin a replacement public key. If the key is exposed, stop publishing immediately, revoke trust in the compromised key with a new application release, and rotate it.
+Release binaries and manifests belong in GitHub Releases, never the source tree. If the CNG key is lost or suspected compromised, stop publishing and perform another manual trust reset; an old client cannot securely authenticate that transition by itself.

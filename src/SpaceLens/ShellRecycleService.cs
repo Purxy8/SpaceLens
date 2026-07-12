@@ -64,7 +64,7 @@ internal static class ShellRecycleService
         if (!OperatingSystem.IsWindowsVersionAtLeast(10)) throw new PlatformNotSupportedException("Recycle-only cleanup requires Windows 10 or later.");
         ArgumentNullException.ThrowIfNull(items);
         if (!NativeResolvedPath.TryResolveDirectory(expectedRoot, out string liveRoot, out string rootError)
-            || !string.Equals(Path.GetFullPath(expectedRoot).TrimEnd('\\'), liveRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            || !string.Equals(Path.GetFullPath(expectedRoot).TrimEnd('\\'), liveRoot.TrimEnd('\\'), StringComparison.Ordinal))
             throw new InvalidDataException("The scanned location changed before cleanup: " + rootError);
 
         var queued = new List<FileItem>(items.Count);

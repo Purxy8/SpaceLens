@@ -352,7 +352,7 @@ internal static class NtfsChangeJournal
             if ((tag.ReparseTag & FileNameSurrogateReparseTag) != 0)
                 return new(null, false, string.Empty);
         }
-        if (!NativeResolvedPath.TryResolveHandle(file, out string path, out string pathError) || !NativeResolvedPath.IsStrictlyUnder(path, root))
+        if (!NativeResolvedPath.TryResolveHandle(file, out string path, out string pathError) || !IsStrictlyUnderCanonicalRoot(path, root))
             return new(null, true, "A changed file path could not be contained under the scanned volume: " + pathError);
         if (!GetFileInformationByHandle(file, out ByHandleFileInformation info))
             return new(null, true, "Windows did not expose metadata for a changed file.");
@@ -444,6 +444,19 @@ internal static class NtfsChangeJournal
         return data;
     }
 
+    private static bool IsStrictlyUnderCanonicalRoot(string path, string root)
+    {
+        try
+        {
+            string fullPath = Path.GetFullPath(path);
+            string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return fullPath.Length > fullRoot.Length
+                && fullPath[fullRoot.Length] == Path.DirectorySeparatorChar
+                && fullPath.StartsWith(fullRoot, StringComparison.Ordinal);
+        }
+        catch { return false; }
+    }
+
     private static string SafeReason(Exception ex)
     {
         string text = ex.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
@@ -502,6 +515,11 @@ internal static class NtfsChangeJournal
             if ((fileCycles.AllReasons & UnsupportedFileReasons) != unsupportedReasons
                 || (fileCycles.LatestCycleReasons & UnsupportedFileReasons) != 0)
                 throw new InvalidDataException("Cross-cycle stream or hard-link reasons were not preserved safely.");
+            string containmentRoot = Path.Combine(Path.GetPathRoot(Path.GetTempPath()) ?? "C:\\", "SpaceLens-CaseRoot");
+            string containedPath = Path.Combine(containmentRoot, "child.bin");
+            string caseVariant = Path.Combine(Path.GetDirectoryName(containmentRoot)!, "spacelens-caseroot", "child.bin");
+            if (!IsStrictlyUnderCanonicalRoot(containedPath, containmentRoot) || IsStrictlyUnderCanonicalRoot(caseVariant, containmentRoot))
+                throw new InvalidDataException("Canonical journal containment did not preserve case-sensitive boundaries.");
             return true;
         }
         catch (Exception ex) { error = ex.Message; return false; }

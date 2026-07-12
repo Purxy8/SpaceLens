@@ -47,9 +47,19 @@ internal static class UpdateService
     private const long MaximumInstallerBytes = 250L * 1024 * 1024;
     private const int MaximumManifestBytes = 64 * 1024;
     private const int MaximumStateBytes = 4 * 1024;
+    private const int MaximumAttemptStampBytes = 128;
+    private const int MaximumRedirects = 5;
+    private static readonly string[] AllowedUpdateHosts = ["github.com", "release-assets.githubusercontent.com"];
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
     private static readonly object StateGate = new();
     private static string StatePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-state.json");
+    private static string AttemptStampPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-attempt.txt");
+    private static DateTimeOffset? processAutomaticAttemptUtc;
+
+    static UpdateService()
+    {
+        if (Environment.GetCommandLineArgs().Contains("--self-test", StringComparer.Ordinal)) RunSecuritySelfTest();
+    }
 
     private sealed class UpdateState
     {
@@ -76,9 +86,8 @@ internal static class UpdateService
         {
             UpdateState state = ReadState();
             if (!state.AutomaticChecksEnabled) return false;
-            if (state.LastAutomaticAttemptUtc is not DateTimeOffset last) return true;
-            TimeSpan age = DateTimeOffset.UtcNow - last;
-            return age < TimeSpan.Zero || age >= TimeSpan.FromHours(24);
+            DateTimeOffset? last = Latest(state.LastAutomaticAttemptUtc, ReadAttemptStamp(), processAutomaticAttemptUtc);
+            return AutomaticAttemptIsDue(last, DateTimeOffset.UtcNow);
         }
     }
 
@@ -86,7 +95,12 @@ internal static class UpdateService
     {
         lock (StateGate)
         {
-            try { UpdateState state = ReadState(); state.LastAutomaticAttemptUtc = DateTimeOffset.UtcNow; WriteState(state); } catch { }
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            processAutomaticAttemptUtc = now;
+            // Keep an independent, bounded attempt marker. If update-state.json is
+            // temporarily locked, a later launch can still avoid checking again.
+            TryWriteAttemptStamp(now);
+            try { UpdateState state = ReadState(); state.LastAutomaticAttemptUtc = now; WriteState(state); } catch { }
         }
     }
 
@@ -126,9 +140,49 @@ internal static class UpdateService
         finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
     }
 
+    private static DateTimeOffset? Latest(params DateTimeOffset?[] values)
+    {
+        DateTimeOffset? latest = null;
+        foreach (DateTimeOffset? value in values)
+            if (value is DateTimeOffset candidate && (latest is null || candidate > latest.Value)) latest = candidate;
+        return latest;
+    }
+
+    private static bool AutomaticAttemptIsDue(DateTimeOffset? last, DateTimeOffset now)
+        => last is not DateTimeOffset recorded || now - recorded >= TimeSpan.FromHours(24);
+
+    private static DateTimeOffset? ReadAttemptStamp()
+    {
+        try
+        {
+            using var file = new FileStream(AttemptStampPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            if (file.Length <= 0 || file.Length > MaximumAttemptStampBytes) return null;
+            using var reader = new StreamReader(file, new UTF8Encoding(false, true), false, 256, false);
+            string value = reader.ReadToEnd().Trim();
+            return DateTimeOffset.TryParseExact(value, "O", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTimeOffset parsed) ? parsed : null;
+        }
+        catch { return null; }
+    }
+
+    private static void TryWriteAttemptStamp(DateTimeOffset value)
+    {
+        string directory = Path.GetDirectoryName(AttemptStampPath)!;
+        string temp = Path.Combine(directory, $".update-attempt-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            Directory.CreateDirectory(directory);
+            byte[] bytes = Encoding.UTF8.GetBytes(value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture));
+            if (bytes.Length > MaximumAttemptStampBytes) return;
+            using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 256, FileOptions.WriteThrough)) { file.Write(bytes); file.Flush(true); }
+            File.Move(temp, AttemptStampPath, true);
+        }
+        catch { }
+        finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
+    }
+
     internal static async Task<UpdateManifest?> CheckAsync(CancellationToken token)
     {
-        using HttpClient client = CreateClient(); using var response = await client.GetAsync(FeedUrl, HttpCompletionOption.ResponseHeadersRead, token); response.EnsureSuccessStatusCode(); ValidateFinalTransport(response.RequestMessage?.RequestUri);
+        using HttpClient client = CreateClient(TimeSpan.FromMinutes(1)); using var response = await GetWithValidatedRedirectsAsync(client, new Uri(FeedUrl), token); response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is > MaximumManifestBytes) throw new InvalidDataException("The update manifest is too large."); await using Stream manifestStream = await response.Content.ReadAsStreamAsync(token); byte[] bytes = await ReadBoundedAsync(manifestStream, MaximumManifestBytes, token);
         UpdateManifest manifest = ParseAndValidate(bytes); if (!SemanticVersion.TryParse(CurrentVersionText, out var current)) throw new InvalidOperationException("The installed application version is invalid."); if (!SemanticVersion.TryParse(manifest.Version, out var available)) throw new InvalidDataException("The update version is invalid."); return available.CompareTo(current) > 0 ? manifest : null;
     }
@@ -142,25 +196,45 @@ internal static class UpdateService
         }
         var manifest = JsonSerializer.Deserialize<UpdateManifest>(json.Span, JsonOptions) ?? throw new InvalidDataException("The update manifest is invalid.");
         if (manifest.SchemaVersion != 1 || !SemanticVersion.TryParse(manifest.Version, out _) || manifest.Tag != "v" + manifest.Version || manifest.AssetName != AssetName) throw new InvalidDataException("The update manifest identifies an unsupported release.");
-        if (manifest.SizeBytes <= 0 || manifest.SizeBytes > MaximumInstallerBytes || manifest.Sha256.Length != 64 || !manifest.Sha256.All(Uri.IsHexDigit) || manifest.Notes.Length > 4000 || manifest.PublishedUtc > DateTimeOffset.UtcNow.AddDays(1)) throw new InvalidDataException("The update manifest contains invalid values.");
+        if (manifest.SizeBytes <= 0 || manifest.SizeBytes > MaximumInstallerBytes || manifest.Sha256.Length != 64 || !manifest.Sha256.All(Uri.IsHexDigit) || manifest.Notes.Length > 4000 || manifest.PublishedUtc < new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero) || manifest.PublishedUtc > DateTimeOffset.UtcNow.AddDays(1)) throw new InvalidDataException("The update manifest contains invalid values.");
         byte[] signature; try { signature = Convert.FromBase64String(manifest.Signature); } catch (FormatException) { throw new CryptographicException("The update manifest signature is invalid."); }
-        using var key = ECDsa.Create(); using Stream publicKey = Assembly.GetExecutingAssembly().GetManifestResourceStream("SpaceLens.UpdatePublicKey.pem") ?? throw new InvalidOperationException("The update verification key is missing."); using var reader = new StreamReader(publicKey); key.ImportFromPem(reader.ReadToEnd());
-        if (!key.VerifyData(Encoding.UTF8.GetBytes(manifest.Canonical()), signature, HashAlgorithmName.SHA256)) throw new CryptographicException("The update manifest was not signed by SpaceLens."); return manifest;
+        if (signature.Length != 64) throw new CryptographicException("The update manifest signature has an invalid length.");
+        using var key = ECDsa.Create(); using Stream publicKey = Assembly.GetExecutingAssembly().GetManifestResourceStream("SpaceLens.UpdatePublicKey.pem") ?? throw new InvalidOperationException("The update verification key is missing."); using var reader = new StreamReader(publicKey); string publicPem = reader.ReadToEnd();
+        if (!publicPem.Contains("-----BEGIN PUBLIC KEY-----", StringComparison.Ordinal) || publicPem.Contains("PRIVATE KEY", StringComparison.Ordinal)) throw new InvalidOperationException("The embedded update verification key is not public-only SPKI material.");
+        key.ImportFromPem(publicPem);
+        bool containsPrivateKey;
+        try { _ = key.ExportParameters(true); containsPrivateKey = true; }
+        catch (CryptographicException) { containsPrivateKey = false; }
+        if (containsPrivateKey) throw new InvalidOperationException("The embedded update verification asset contains private key material.");
+        if (key.KeySize != 256 || !key.VerifyData(Encoding.UTF8.GetBytes(manifest.Canonical()), signature, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation)) throw new CryptographicException("The update manifest was not signed by SpaceLens."); return manifest;
     }
 
     internal static async Task<bool> OfferAndInstallAsync(Form owner, UpdateManifest manifest)
     {
+        if (ProcessSecurity.IsElevated)
+        {
+            MessageBox.Show(owner, ProcessSecurity.ElevatedPerUserOperationMessage, "Restart SpaceLens normally", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
         string notes = string.IsNullOrWhiteSpace(manifest.Notes) ? "This release includes improvements and fixes." : manifest.Notes;
         if (MessageBox.Show(owner, $"SpaceLens {manifest.Version} is available.\n\n{notes}\n\nDownload and start the verified installer?", "SpaceLens update available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return false;
         using var progressForm = new UpdateProgressForm(manifest.Version); progressForm.Show(owner);
+        string? installer = null; bool launched = false;
         try
         {
-            string installer = await DownloadInstallerAsync(manifest, progressForm.Progress, progressForm.Token); progressForm.MarkComplete(); progressForm.Close();
-            var start = new System.Diagnostics.ProcessStartInfo(installer) { UseShellExecute = false }; start.ArgumentList.Add("--upgrade"); start.ArgumentList.Add("--wait-pid"); start.ArgumentList.Add(Environment.ProcessId.ToString());
-            if (System.Diagnostics.Process.Start(start) is null) throw new InvalidOperationException("Windows could not start the update installer."); Application.Exit(); return true;
+            installer = await DownloadInstallerAsync(manifest, progressForm.Progress, progressForm.Token); progressForm.MarkComplete(); progressForm.Close();
+            if (ProcessSecurity.IsElevated) throw new SecurityException(ProcessSecurity.ElevatedPerUserOperationMessage);
+            // Re-hash through a no-write/no-delete sharing handle and retain that
+            // handle until CreateProcess has opened the verified image.
+            using FileStream launchLock = OpenVerifiedInstaller(installer, manifest);
+            var start = new System.Diagnostics.ProcessStartInfo(installer) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(installer)! }; start.ArgumentList.Add("--upgrade"); start.ArgumentList.Add("--wait-pid"); start.ArgumentList.Add(Environment.ProcessId.ToString());
+            using System.Diagnostics.Process? process = System.Diagnostics.Process.Start(start);
+            if (process is null) throw new InvalidOperationException("Windows could not start the update installer.");
+            launched = true; Application.Exit(); return true;
         }
         catch (OperationCanceledException) { progressForm.Close(); return false; }
         catch (Exception ex) { progressForm.Close(); MessageBox.Show(owner, $"The update was not installed.\n\n{ex.Message}", "Update failed", MessageBoxButtons.OK, MessageBoxIcon.Error); return false; }
+        finally { if (!launched && installer is not null) TryDeleteInstaller(installer); }
     }
 
     private static async Task<string> DownloadInstallerAsync(UpdateManifest manifest, IProgress<(long Received, long Total)> progress, CancellationToken token)
@@ -168,7 +242,7 @@ internal static class UpdateService
         string url = BuildInstallerUrl(manifest); string partial = Path.Combine(Path.GetTempPath(), $"SpaceLens-Setup-{manifest.Version}-{Guid.NewGuid():N}.partial"), complete = Path.ChangeExtension(partial, ".exe");
         try
         {
-            using HttpClient client = CreateClient(); using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token); response.EnsureSuccessStatusCode(); ValidateFinalTransport(response.RequestMessage?.RequestUri);
+            using HttpClient client = CreateClient(TimeSpan.FromMinutes(10)); using var response = await GetWithValidatedRedirectsAsync(client, new Uri(url), token); response.EnsureSuccessStatusCode();
             if (response.Content.Headers.ContentLength is long length && length != manifest.SizeBytes) throw new InvalidDataException("The installer size does not match the signed release manifest.");
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256); await using var source = await response.Content.ReadAsStreamAsync(token); await using (var output = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
@@ -182,12 +256,32 @@ internal static class UpdateService
         catch { try { if (File.Exists(partial)) File.Delete(partial); if (File.Exists(complete)) File.Delete(complete); } catch { } throw; }
     }
 
-    internal static string BuildInstallerUrl(UpdateManifest manifest) => $"https://github.com/{Repository}/releases/download/{manifest.Tag}/{AssetName}";
+    internal static string BuildInstallerUrl(UpdateManifest manifest)
+    {
+        var uri = new Uri($"https://github.com/{Repository}/releases/download/{manifest.Tag}/{AssetName}");
+        ValidateTransportUri(uri);
+        return uri.AbsoluteUri;
+    }
     internal static void VerifyInstallerFile(string path, UpdateManifest manifest)
     {
-        var info = new FileInfo(path); if (!info.Exists || info.Length != manifest.SizeBytes) throw new InvalidDataException("The installer size does not match the signed release manifest.");
-        using (var executable = File.OpenRead(path)) if (executable.ReadByte() != 'M' || executable.ReadByte() != 'Z') throw new InvalidDataException("The update is not a valid Windows executable.");
-        using var stream = File.OpenRead(path); byte[] expected = Convert.FromHexString(manifest.Sha256), actual = SHA256.HashData(stream); if (!CryptographicOperations.FixedTimeEquals(expected, actual)) throw new CryptographicException("The installer hash does not match the signed release manifest.");
+        using FileStream stream = OpenVerifiedInstaller(path, manifest);
+    }
+
+    private static FileStream OpenVerifiedInstaller(string path, UpdateManifest manifest)
+    {
+        FileStream? stream = null;
+        try
+        {
+            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
+            if (stream.Length != manifest.SizeBytes) throw new InvalidDataException("The installer size does not match the signed release manifest.");
+            if (stream.ReadByte() != 'M' || stream.ReadByte() != 'Z') throw new InvalidDataException("The update is not a valid Windows executable.");
+            stream.Position = 0;
+            byte[] expected = Convert.FromHexString(manifest.Sha256), actual = SHA256.HashData(stream);
+            if (!CryptographicOperations.FixedTimeEquals(expected, actual)) throw new CryptographicException("The installer hash does not match the signed release manifest.");
+            stream.Position = 0;
+            FileStream verified = stream; stream = null; return verified;
+        }
+        finally { stream?.Dispose(); }
     }
 
     internal static int VerifyRelease(string manifestPath, string installerPath)
@@ -202,9 +296,50 @@ internal static class UpdateService
         catch { return 1; }
     }
 
-    private static HttpClient CreateClient()
+    private static HttpClient CreateClient(TimeSpan timeout)
     {
-        var handler = new HttpClientHandler { AllowAutoRedirect = true, MaxAutomaticRedirections = 5, CheckCertificateRevocationList = true, AutomaticDecompression = DecompressionMethods.None }; var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) }; client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("SpaceLens", CurrentVersionText)); return client;
+        var handler = new HttpClientHandler { AllowAutoRedirect = false, CheckCertificateRevocationList = true, AutomaticDecompression = DecompressionMethods.None, UseCookies = false }; var client = new HttpClient(handler) { Timeout = timeout }; client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("SpaceLens", CurrentVersionText)); return client;
+    }
+
+    private static async Task<HttpResponseMessage> GetWithValidatedRedirectsAsync(HttpClient client, Uri initialUri, CancellationToken token)
+    {
+        Uri current = initialUri;
+        for (int redirects = 0; ; redirects++)
+        {
+            ValidateTransportUri(current);
+            HttpResponseMessage? response = null;
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, current);
+                response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                if (!IsRedirect(response.StatusCode)) return response;
+                if (redirects >= MaximumRedirects) throw new SecurityException("The GitHub update request exceeded the redirect limit.");
+                Uri? location = response.Headers.Location;
+                if (location is null) throw new SecurityException("GitHub returned an update redirect without a destination.");
+                Uri next = location.IsAbsoluteUri ? location : new Uri(current, location);
+                ValidateTransportUri(next);
+                current = next;
+            }
+            finally
+            {
+                if (response is not null && IsRedirect(response.StatusCode)) response.Dispose();
+            }
+        }
+    }
+
+    private static bool IsRedirect(HttpStatusCode status)
+        => (int)status is 301 or 302 or 303 or 307 or 308;
+
+    private static void ValidateTransportUri(Uri? uri)
+    {
+        if (uri is null
+            || !uri.IsAbsoluteUri
+            || !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            || !uri.IsDefaultPort
+            || uri.UserInfo.Length != 0
+            || uri.Fragment.Length != 0
+            || !AllowedUpdateHosts.Contains(uri.IdnHost, StringComparer.OrdinalIgnoreCase))
+            throw new SecurityException("The update request targeted an unexpected network location.");
     }
     internal static async Task<byte[]> ReadBoundedAsync(Stream source, int maximumBytes, CancellationToken token)
     {
@@ -221,7 +356,71 @@ internal static class UpdateService
             if (destination.Length > maximumBytes) throw new InvalidDataException("The update manifest is too large.");
         }
     }
-    private static void ValidateFinalTransport(Uri? uri) { if (uri is null || uri.Scheme != Uri.UriSchemeHttps || !(uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase))) throw new SecurityException("GitHub redirected the update request to an unexpected location."); }
+    private static void TryDeleteInstaller(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
+
+    private static void RunSecuritySelfTest()
+    {
+        ValidateTransportUri(new Uri(FeedUrl));
+        ValidateTransportUri(new Uri("https://release-assets.githubusercontent.com/github-production-release-asset/example"));
+        string[] rejected =
+        [
+            "http://github.com/Purxy8/SpaceLens/releases/latest/download/update.json",
+            "https://github.com.evil.example/update.json",
+            "https://raw.githubusercontent.com/Purxy8/SpaceLens/main/update.json",
+            "https://release-assets.githubusercontent.com.evil.example/file",
+            "https://github.com:444/update.json",
+            "https://user@github.com/update.json",
+            "https://github.com/update.json#fragment"
+        ];
+        foreach (string value in rejected)
+        {
+            bool failedClosed = false;
+            try { ValidateTransportUri(new Uri(value)); }
+            catch (SecurityException) { failedClosed = true; }
+            if (!failedClosed) throw new InvalidOperationException("Update transport allowlist self-test failed.");
+        }
+        using (var allowedHandler = new RedirectSelfTestHandler((request, number) => number switch
+        {
+            1 => Redirect("https://release-assets.githubusercontent.com/github-production-release-asset/file"),
+            2 when request.RequestUri?.Host == "release-assets.githubusercontent.com" => new HttpResponseMessage(HttpStatusCode.OK),
+            _ => new HttpResponseMessage(HttpStatusCode.InternalServerError)
+        }))
+        using (var client = new HttpClient(allowedHandler))
+        using (HttpResponseMessage response = GetWithValidatedRedirectsAsync(client, new Uri(FeedUrl), CancellationToken.None).GetAwaiter().GetResult())
+            if (response.StatusCode != HttpStatusCode.OK || allowedHandler.Requests != 2) throw new InvalidOperationException("Allowed update redirect self-test failed.");
+
+        using (var rejectedHandler = new RedirectSelfTestHandler((_, _) => Redirect("https://evil.example/update.json")))
+        using (var client = new HttpClient(rejectedHandler))
+        {
+            bool rejectedHop = false;
+            try { using HttpResponseMessage _ = GetWithValidatedRedirectsAsync(client, new Uri(FeedUrl), CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (SecurityException) { rejectedHop = true; }
+            if (!rejectedHop || rejectedHandler.Requests != 1) throw new InvalidOperationException("Redirect-hop rejection self-test failed.");
+        }
+        if (!ProcessSecurity.ShouldRefusePerUserOperation(true) || ProcessSecurity.ShouldRefusePerUserOperation(false)) throw new InvalidOperationException("Elevated update policy self-test failed.");
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (!AutomaticAttemptIsDue(null, now) || AutomaticAttemptIsDue(now.AddHours(-23), now) || !AutomaticAttemptIsDue(now.AddHours(-25), now) || AutomaticAttemptIsDue(now.AddHours(1), now)) throw new InvalidOperationException("Automatic update cadence self-test failed.");
+        InstallerLifecycle.RunSecuritySelfTest();
+    }
+
+    private static HttpResponseMessage Redirect(string location)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.Found);
+        response.Headers.Location = new Uri(location);
+        return response;
+    }
+
+    private sealed class RedirectSelfTestHandler(Func<HttpRequestMessage, int, HttpResponseMessage> responseFactory) : HttpMessageHandler
+    {
+        internal int Requests { get; private set; }
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            HttpResponseMessage response = responseFactory(request, ++Requests);
+            response.RequestMessage = request;
+            return Task.FromResult(response);
+        }
+    }
 }
 
 internal sealed class UpdateProgressForm : Form

@@ -22,6 +22,8 @@ internal sealed record ElevatedRefreshResult(
     NtfsJournalCheckpoint JournalCheckpoint,
     string FallbackReason);
 
+internal readonly record struct ValidatedScanRoot(string Path, NativeFileId Identity);
+
 /// <summary>
 /// Runs the existing buffered scanner in a short-lived elevated copy of the
 /// same executable. The ordinary UI remains unelevated; only SeBackupPrivilege
@@ -34,13 +36,19 @@ internal static class ElevatedScanRunner
     private const string PipePrefix = "SpaceLens.Scan.";
     private const int ErrorCancelled = 1223;
     private const int PipeBufferSize = 64 * 1024;
+    private const uint FileFlagBackupSemantics = 0x02000000;
     internal static readonly PipeOptions ServerPipeOptions = PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
     internal static readonly PipeOptions HelperClientPipeOptions = PipeOptions.Asynchronous;
     private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(2);
 
     internal static bool IsHelperCommand(string[] args)
-        => args.Length > 0 && string.Equals(args[0], HelperSwitch, StringComparison.Ordinal);
+    {
+        // Keep recognizing the switch while the capability is disabled so an
+        // externally supplied helper command reaches RunHelper's fail-closed
+        // gate instead of falling through to the ordinary UI.
+        return args.Length > 0 && string.Equals(args[0], HelperSwitch, StringComparison.Ordinal);
+    }
 
     internal static bool IsAdministrator
     {
@@ -61,7 +69,12 @@ internal static class ElevatedScanRunner
 
     internal static bool SupportsRoot(string root, out string reason)
     {
-        try { _ = NormalizeAndValidateRoot(root); reason = string.Empty; return true; }
+        if (!SecurityPolicy.ElevatedFullAccessAvailable)
+        {
+            reason = SecurityPolicy.ElevatedFullAccessUnavailableReason;
+            return false;
+        }
+        try { _ = ResolveAndValidateRoot(root); reason = string.Empty; return true; }
         catch (Exception ex) when (ex is ArgumentException or DirectoryNotFoundException or IOException or UnauthorizedAccessException)
         {
             reason = ex.Message;
@@ -75,12 +88,14 @@ internal static class ElevatedScanRunner
         CancellationToken token,
         IProgress<bool>? started = null)
     {
+        EnsureFullAccessEnabled();
         ArgumentNullException.ThrowIfNull(progress);
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Elevated scanning is available only on Windows.");
         if (IsDotNetHost(Environment.ProcessPath)) throw new InvalidOperationException("Full access scan is available only from the packaged SpaceLens application.");
         token.ThrowIfCancellationRequested();
 
-        string fullRoot = NormalizeAndValidateRoot(root);
+        ValidatedScanRoot validatedRoot = ResolveAndValidateRoot(root);
+        string fullRoot = validatedRoot.Path;
         var rootContext = new CanonicalRootContext(fullRoot);
         string pipeName = PipePrefix + Guid.NewGuid().ToString("N");
         byte[] nonce = RandomNumberGenerator.GetBytes(ElevatedScanProtocol.NonceLength);
@@ -118,11 +133,11 @@ internal static class ElevatedScanRunner
                 finally { hello.ClearBody(); }
             }
 
-            await ElevatedScanProtocol.WriteStartAsync(server, fullRoot, token).ConfigureAwait(false);
+            await ElevatedScanProtocol.WriteStartAsync(server, fullRoot, validatedRoot.Identity, token).ConfigureAwait(false);
 
-            int receivedFiles = 0;
             int lastSkipped = 0;
             bool readyReceived = false;
+            var decodeBudget = new ElevatedScanDecodeBudget();
             while (true)
             {
                 Task<ElevatedScanFrame> readTask = ElevatedScanProtocol.ReadFrameAsync(server, CancellationToken.None);
@@ -152,7 +167,7 @@ internal static class ElevatedScanRunner
                         case ElevatedScanFrameType.Batch:
                             {
                                 if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
-                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
+                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame, decodeBudget);
                                 if (skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
                                 foreach (FileItem item in batch)
                                 {
@@ -162,9 +177,6 @@ internal static class ElevatedScanRunner
                                     if (!rootContext.ContainsCanonicalPath(item.Path))
                                         throw new InvalidDataException("The helper returned a path outside the selected scan root.");
                                 }
-                                receivedFiles = checked(receivedFiles + batch.Count);
-                                if (receivedFiles > ElevatedScanProtocol.MaximumTotalFiles)
-                                    throw new InvalidDataException("The elevated scan exceeded the supported file-count limit.");
                                 lastSkipped = skipped;
                                 progress.Report((batch, skipped));
                                 break;
@@ -205,14 +217,18 @@ internal static class ElevatedScanRunner
         IProgress<ElevatedRefreshProgress>? progress = null,
         IProgress<bool>? started = null)
     {
+        EnsureFullAccessEnabled();
         if (!checkpoint.IsValid) throw new ArgumentException("The saved scan has no valid quick-refresh checkpoint.", nameof(checkpoint));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(baselineDriveUsedBytes);
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("NTFS quick refresh is available only on Windows.");
         if (IsDotNetHost(Environment.ProcessPath)) throw new InvalidOperationException("Quick refresh is available only from the packaged SpaceLens application.");
         token.ThrowIfCancellationRequested();
 
-        string fullRoot = NormalizeAndValidateRoot(root);
+        ValidatedScanRoot validatedRoot = ResolveAndValidateRoot(root);
+        string fullRoot = validatedRoot.Path;
         if (!NtfsChangeJournal.SupportsRoot(fullRoot, out string refreshReason)) throw new NotSupportedException(refreshReason);
+        if (checkpoint.VolumeSerial != validatedRoot.Identity.VolumeSerial)
+            throw new InvalidOperationException("The saved quick-refresh checkpoint belongs to a different root volume.");
         var rootContext = new CanonicalRootContext(fullRoot);
         string pipeName = PipePrefix + Guid.NewGuid().ToString("N");
         byte[] nonce = RandomNumberGenerator.GetBytes(ElevatedScanProtocol.NonceLength);
@@ -245,9 +261,10 @@ internal static class ElevatedScanRunner
                 finally { CryptographicOperations.ZeroMemory(receivedNonce); hello.ClearBody(); }
             }
 
-            await ElevatedScanProtocol.WriteRefreshStartAsync(server, fullRoot, checkpoint, baselineDriveUsedBytes, token).ConfigureAwait(false);
+            await ElevatedScanProtocol.WriteRefreshStartAsync(server, fullRoot, validatedRoot.Identity, checkpoint, baselineDriveUsedBytes, token).ConfigureAwait(false);
             var files = new List<FileItem>();
             var removed = new List<NativeFileId>();
+            var decodeBudget = new ElevatedScanDecodeBudget();
             int lastSkipped = 0;
             bool readyReceived = false, fallbackReceived = false;
             bool backupPrivilege = false;
@@ -289,7 +306,7 @@ internal static class ElevatedScanRunner
                         case ElevatedScanFrameType.Batch:
                             {
                                 if (!readyReceived) throw new InvalidDataException("The elevated scanner returned files before it was ready.");
-                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame);
+                                (List<FileItem> batch, int skipped) = ElevatedScanProtocol.ReadBatch(frame, decodeBudget);
                                 if (!fallbackReceived && skipped != 0) throw new InvalidDataException("A quick-refresh delta reported skipped full-scan locations.");
                                 if (fallbackReceived && skipped < lastSkipped) throw new InvalidDataException("The helper skipped-location count moved backwards.");
                                 foreach (FileItem item in batch)
@@ -309,7 +326,7 @@ internal static class ElevatedScanRunner
                         case ElevatedScanFrameType.Removed:
                             {
                                 if (!readyReceived || fallbackReceived) throw new InvalidDataException("The helper returned removed IDs during a full-scan fallback.");
-                                List<NativeFileId> batch = ElevatedScanProtocol.ReadRemoved(frame);
+                                List<NativeFileId> batch = ElevatedScanProtocol.ReadRemoved(frame, decodeBudget);
                                 foreach (NativeFileId id in batch)
                                     if (id.VolumeSerial != checkpoint.VolumeSerial) throw new InvalidDataException("A removed-file identity belongs to a different volume.");
                                 if (removed.Count > ElevatedScanProtocol.MaximumTotalFiles - batch.Count)
@@ -364,6 +381,7 @@ internal static class ElevatedScanRunner
 
     internal static int RunHelper(string[] args)
     {
+        if (!SecurityPolicy.ElevatedFullAccessAvailable) return 6;
         if (!TryParseHelperArguments(args, out string pipeName, out byte[] nonce, out int parentPid)) return 2;
 
         NamedPipeClientStream? pipe = null;
@@ -395,7 +413,9 @@ internal static class ElevatedScanRunner
 
             if (!IsAdministrator) throw new UnauthorizedAccessException("The scan helper did not receive administrator rights.");
 
-            string root;
+            using WindowsBackupPrivilege backupPrivilege = WindowsBackupPrivilege.TryEnable();
+            string requestedRoot;
+            NativeFileId requestedRootIdentity;
             bool refreshRequested;
             NtfsJournalCheckpoint refreshCheckpoint = default;
             long baselineDriveUsedBytes = 0;
@@ -404,15 +424,17 @@ internal static class ElevatedScanRunner
                 refreshRequested = startFrame.Type == ElevatedScanFrameType.RefreshStart;
                 if (refreshRequested)
                 {
-                    (string requestedRoot, refreshCheckpoint, baselineDriveUsedBytes) = ElevatedScanProtocol.ReadRefreshStart(startFrame);
-                    root = NormalizeAndValidateRoot(requestedRoot);
+                    (requestedRoot, requestedRootIdentity, refreshCheckpoint, baselineDriveUsedBytes) = ElevatedScanProtocol.ReadRefreshStart(startFrame);
                 }
-                else root = NormalizeAndValidateRoot(ElevatedScanProtocol.ReadStart(startFrame));
+                else (requestedRoot, requestedRootIdentity) = ElevatedScanProtocol.ReadStart(startFrame);
             }
+            ValidatedScanRoot validatedRoot = ResolveAndValidateBoundRoot(requestedRoot, requestedRootIdentity);
+            string root = validatedRoot.Path;
+            if (refreshRequested && refreshCheckpoint.VolumeSerial != validatedRoot.Identity.VolumeSerial)
+                throw new InvalidDataException("The quick-refresh checkpoint belongs to a different root volume.");
             var rootContext = new CanonicalRootContext(root);
             cancelWatcher = WatchForCancelAsync(pipe, scanCancellation);
 
-            using WindowsBackupPrivilege backupPrivilege = WindowsBackupPrivilege.TryEnable();
             ElevatedScanProtocol.WriteReadyAsync(pipe, backupPrivilege.Enabled, scanCancellation.Token).GetAwaiter().GetResult();
 
             if (refreshRequested)
@@ -502,6 +524,7 @@ internal static class ElevatedScanRunner
         int parentPid,
         CancellationToken token)
     {
+        EnsureFullAccessEnabled();
         try
         {
             return await Task.Run(() =>
@@ -519,6 +542,7 @@ internal static class ElevatedScanRunner
 
     private static ProcessStartInfo CreateHelperStartInfo(string pipeName, string nonce, int parentPid)
     {
+        EnsureFullAccessEnabled();
         string executable = Environment.ProcessPath ?? throw new InvalidOperationException("The SpaceLens executable path is unavailable.");
         var startInfo = new ProcessStartInfo
         {
@@ -712,7 +736,7 @@ internal static class ElevatedScanRunner
         return true;
     }
 
-    private static string NormalizeAndValidateRoot(string root)
+    private static ValidatedScanRoot ResolveAndValidateRoot(string root)
     {
         if (string.IsNullOrWhiteSpace(root) || root.IndexOf('\0') >= 0 || root.Length > 32_767)
             throw new ArgumentException("The scan root is invalid.", nameof(root));
@@ -725,13 +749,42 @@ internal static class ElevatedScanRunner
             || fullRoot.StartsWith(@"\\", StringComparison.OrdinalIgnoreCase)
             || fullRoot.Length > 32_767)
             throw new ArgumentException("Full access scan supports local fixed-drive paths only.", nameof(root));
-        if (!Directory.Exists(fullRoot)) throw new DirectoryNotFoundException("The selected elevated scan root does not exist.");
-        if (!NativeResolvedPath.TryResolveDirectory(fullRoot, out fullRoot, out string resolutionError))
+
+        using SafeFileHandle handle = CreateFileW(
+            NativePath.For(fullRoot),
+            0,
+            FileShare.ReadWrite | FileShare.Delete,
+            IntPtr.Zero,
+            FileMode.Open,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            throw new IOException("The selected elevated scan root could not be opened safely: " + new Win32Exception(error).Message);
+        }
+        if (!NativeResolvedPath.TryResolveHandle(handle, out string resolvedRoot, out string resolutionError))
             throw new IOException("The selected elevated scan root could not be resolved safely: " + resolutionError);
-        string? driveRoot = Path.GetPathRoot(fullRoot);
+        if (!NativeFileIdentity.TryGet(handle, out NativeFileInformation identity)
+            || (identity.Attributes & FileAttributes.Directory) == 0
+            || identity.Id.VolumeSerial == 0
+            || identity.Id.FileIndex == 0)
+            throw new IOException("Windows did not expose a stable directory identity for the selected elevated scan root.");
+
+        string? driveRoot = Path.GetPathRoot(resolvedRoot);
         if (string.IsNullOrWhiteSpace(driveRoot) || new DriveInfo(driveRoot).DriveType != DriveType.Fixed)
             throw new ArgumentException("Full access scan supports local fixed drives only.", nameof(root));
-        return fullRoot;
+        return new(resolvedRoot, identity.Id);
+    }
+
+    private static ValidatedScanRoot ResolveAndValidateBoundRoot(string root, NativeFileId expectedIdentity)
+    {
+        if (expectedIdentity.VolumeSerial == 0 || expectedIdentity.FileIndex == 0)
+            throw new InvalidDataException("The elevated scan request has an incomplete root identity.");
+        ValidatedScanRoot liveRoot = ResolveAndValidateRoot(root);
+        if (liveRoot.Identity != expectedIdentity)
+            throw new InvalidDataException("The selected scan root changed filesystem identity while administrator permission was requested.");
+        return liveRoot;
     }
 
     private static bool ParentUsesSameExecutable(int parentPid)
@@ -746,10 +799,14 @@ internal static class ElevatedScanRunner
             string? parentExecutable = parent.MainModule?.FileName;
             if (string.IsNullOrWhiteSpace(parentExecutable)) return false;
             string parentPath = Path.GetFullPath(parentExecutable);
-            if (NativeFileIdentity.TryGet(currentPath, false, out NativeFileInformation currentIdentity)
-                && NativeFileIdentity.TryGet(parentPath, false, out NativeFileInformation parentIdentity))
-                return currentIdentity.Id == parentIdentity.Id;
-            return string.Equals(currentPath, parentPath, StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(currentPath, parentPath, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!NativeFileIdentity.TryGet(currentPath, false, out NativeFileInformation currentIdentity)
+                || !NativeFileIdentity.TryGet(parentPath, false, out NativeFileInformation parentIdentity)
+                || currentIdentity.Id.VolumeSerial == 0
+                || currentIdentity.Id.FileIndex == 0
+                || parentIdentity.Id.VolumeSerial == 0
+                || parentIdentity.Id.FileIndex == 0) return false;
+            return currentIdentity.Id == parentIdentity.Id;
         }
         catch { return false; }
     }
@@ -757,6 +814,12 @@ internal static class ElevatedScanRunner
     private static bool IsDotNetHost(string? executable)
         => !string.IsNullOrWhiteSpace(executable)
             && string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase);
+
+    private static void EnsureFullAccessEnabled()
+    {
+        if (!SecurityPolicy.ElevatedFullAccessAvailable)
+            throw new NotSupportedException(SecurityPolicy.ElevatedFullAccessUnavailableReason);
+    }
 
     private static string SafeErrorMessage(Exception exception)
     {
@@ -776,6 +839,56 @@ internal static class ElevatedScanRunner
         if (journalRecords == 0 && currentDriveUsedBytes != baselineDriveUsedBytes)
             return "Drive allocation changed without a complete closed-file journal record.";
         return null;
+    }
+
+    internal static void RunSecuritySelfTest()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (!SecurityPolicy.ElevatedFullAccessAvailable)
+        {
+            bool launchGateRejected = false;
+            try { EnsureFullAccessEnabled(); }
+            catch (NotSupportedException ex) when (ex.Message == SecurityPolicy.ElevatedFullAccessUnavailableReason) { launchGateRejected = true; }
+            if (!launchGateRejected || RunHelper([]) != 6)
+                throw new InvalidDataException("The disabled elevated helper did not fail closed.");
+        }
+
+        string driveRoot = Path.GetPathRoot(Path.GetTempPath()) ?? "C:\\";
+        string caseRoot = Path.Combine(driveRoot, "SpaceLens-CaseRoot");
+        var caseContext = new CanonicalRootContext(caseRoot);
+        if (!caseContext.ContainsCanonicalPath(Path.Combine(caseRoot, "child.bin"))
+            || caseContext.ContainsCanonicalPath(Path.Combine(driveRoot, "spacelens-caseroot", "child.bin")))
+            throw new InvalidDataException("Elevated root containment did not preserve case-sensitive boundaries.");
+
+        string suffix = Guid.NewGuid().ToString("N");
+        string root = Path.Combine(Path.GetTempPath(), "SpaceLens-root-binding-" + suffix);
+        string replacement = Path.Combine(Path.GetTempPath(), "SpaceLens-root-binding-replacement-" + suffix);
+        try
+        {
+            Directory.CreateDirectory(root);
+            Directory.CreateDirectory(replacement);
+            ValidatedScanRoot original = ResolveAndValidateRoot(root);
+            ValidatedScanRoot replacementRoot = ResolveAndValidateRoot(replacement);
+            if (original.Identity == replacementRoot.Identity)
+                throw new InvalidDataException("The root-binding fixture did not produce distinct directory identities.");
+            if (ResolveAndValidateBoundRoot(original.Path, original.Identity) != original)
+                throw new InvalidDataException("The root-binding self-test rejected an unchanged directory identity.");
+
+            bool forgedRejected = false;
+            try { _ = ResolveAndValidateBoundRoot(replacementRoot.Path, original.Identity); }
+            catch (InvalidDataException ex) when (ex.Message.Contains("changed", StringComparison.OrdinalIgnoreCase)) { forgedRejected = true; }
+            if (!forgedRejected) throw new InvalidDataException("The root-binding self-test accepted a substituted directory identity.");
+
+            bool missingRejected = false;
+            try { _ = ResolveAndValidateBoundRoot(original.Path, default); }
+            catch (InvalidDataException ex) when (ex.Message.Contains("identity", StringComparison.OrdinalIgnoreCase)) { missingRejected = true; }
+            if (!missingRejected) throw new InvalidDataException("The root-binding self-test accepted an incomplete directory identity.");
+        }
+        finally
+        {
+            try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { }
+            try { if (Directory.Exists(replacement)) Directory.Delete(replacement, true); } catch { }
+        }
     }
 
     /// <summary>
@@ -798,8 +911,18 @@ internal static class ElevatedScanRunner
         internal bool ContainsCanonicalPath(string path)
             => path.Length > pathPrefix.Length
                 && Path.IsPathFullyQualified(path)
-                && path.StartsWith(pathPrefix, StringComparison.OrdinalIgnoreCase);
+                && path.StartsWith(pathPrefix, StringComparison.Ordinal);
     }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        FileShare shareMode,
+        IntPtr securityAttributes,
+        FileMode creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

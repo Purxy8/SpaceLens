@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Version = '',
-    [string]$SigningKey = '',
     [string]$NuGetConfig = '',
+    [switch]$PrepareOfflineRelease,
     [ValidateLength(1, 4000)]
     [string]$Notes = 'Includes SpaceLens improvements and fixes.'
 )
@@ -17,12 +17,16 @@ $appProject = Join-Path $repository 'src\SpaceLens\SpaceLens.csproj'
 $setupProject = Join-Path $repository 'src\SpaceLens.Setup\SpaceLens.Setup.csproj'
 $signerProject = Join-Path $repository 'tools\ReleaseSigner\ReleaseSigner.csproj'
 $publicKey = Join-Path $repository 'src\SpaceLens\assets\update-public-key.pem'
+$releaseSecurityModule = Join-Path $PSScriptRoot 'ReleaseSecurity.psm1'
 
-foreach ($required in @($versionProperties, $appProject, $setupProject, $signerProject, $publicKey)) {
+foreach ($required in @($versionProperties, $appProject, $setupProject, $signerProject, $publicKey, $releaseSecurityModule)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required file is missing: $required"
     }
 }
+
+Import-Module $releaseSecurityModule -Force
+Assert-PublicSpkiPemFile -Path $publicKey | Out-Null
 
 [xml]$propertiesDocument = Get-Content -Raw -LiteralPath $versionProperties
 $versionNodes = @($propertiesDocument.SelectNodes('/Project/PropertyGroup/SpaceLensVersion'))
@@ -55,23 +59,10 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     throw 'The .NET 10 SDK is required and dotnet was not found on PATH.'
 }
 
-$resolvedKey = ''
-$sourceCommit = ''
-if ($SigningKey) {
-    if (-not (Test-Path -LiteralPath $SigningKey -PathType Leaf)) {
-        throw "Signing key is not a file: $SigningKey"
-    }
-    $resolvedKey = (Resolve-Path -LiteralPath $SigningKey).Path
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        throw 'Git is required for a signed release so source provenance can be verified.'
-    }
-    $gitSafety = "safe.directory=$($repository.Replace('\', '/'))"
-    $workingChanges = @(& git -c $gitSafety -C $repository status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0) { throw 'Git could not inspect the release source tree.' }
-    if ($workingChanges.Count -ne 0) { throw "Signed releases require a clean committed source tree.`n$($workingChanges -join [Environment]::NewLine)" }
-    $sourceCommit = (& git -c $gitSafety -C $repository rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw 'Git could not resolve the release source commit.' }
-    Write-Host "Preparing signed release from commit $sourceCommit"
+$sourceProvenance = $null
+if ($PrepareOfflineRelease) {
+    $sourceProvenance = Get-CleanReleaseProvenance -Repository $repository
+    Write-Host "Preparing offline release inputs from commit $($sourceProvenance.Commit)"
 }
 
 function Get-OwnedChildPath {
@@ -86,7 +77,7 @@ function Get-OwnedChildPath {
         [IO.Path]::AltDirectorySeparatorChar
     ))
     $prefix = $fullParent + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $fullPath.StartsWith($prefix, [StringComparison]::Ordinal)) {
         throw "Refusing to manage a path outside $fullParent`: $fullPath"
     }
 
@@ -103,9 +94,12 @@ function Reset-OwnedDirectory {
     if (Test-Path -LiteralPath $safePath) {
         $resolvedPath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $safePath).Path)
         [void](Get-OwnedChildPath -Path $resolvedPath -Parent $Parent)
+        Assert-ReleasePathHasNoReparsePoints -Path $resolvedPath -StopAt $repository
+        Assert-ReleaseTreeHasNoReparsePoints -Path $resolvedPath
         Remove-Item -LiteralPath $resolvedPath -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $safePath | Out-Null
+    Assert-ReleasePathHasNoReparsePoints -Path $safePath -StopAt $repository
     return $safePath
 }
 
@@ -172,15 +166,14 @@ function Assert-HashFile {
 
 $artifacts = Get-OwnedChildPath -Path $artifacts -Parent $repository
 New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
+Assert-ReleasePathHasNoReparsePoints -Path $artifacts -StopAt $repository
 $intermediate = Reset-OwnedDirectory -Path (Join-Path $artifacts 'intermediate') -Parent $artifacts
-$releaseRoot = Join-Path $artifacts 'release'
-New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
-$releaseDirectory = Get-OwnedChildPath -Path (Join-Path $releaseRoot $Version) -Parent $releaseRoot
 
 $appPublish = Join-Path $intermediate 'app-publish'
 $setupPublish = Join-Path $intermediate 'setup-publish'
 $package = Join-Path $intermediate 'package'
-New-Item -ItemType Directory -Force -Path $appPublish, $setupPublish, $package | Out-Null
+$signerPublish = Join-Path $intermediate 'native-release-signer'
+New-Item -ItemType Directory -Force -Path $appPublish, $setupPublish, $package, $signerPublish | Out-Null
 
 $resolvedNuGetConfig = ''
 $appRestoreArguments = @('restore', $appProject, '-r', 'win-x64', '-p:SpaceLensEnableDiagnostics=false', '--nologo')
@@ -214,6 +207,7 @@ $app = Join-Path $package 'SpaceLens.exe'
 Copy-Item -LiteralPath $publishedApp -Destination $app
 Write-HashFile -Path $app
 Invoke-PackagedExecutable -Path $app -Arguments @('--self-test') -Description 'SpaceLens packaged self-test'
+& (Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1') -Executable $app -WorkDirectory $intermediate
 
 $payloadProperty = "-p:SpaceLensPayload=$app"
 $setupRestoreArguments = @('restore', $setupProject, '-r', 'win-x64', $payloadProperty, '--nologo')
@@ -244,12 +238,35 @@ Copy-Item -LiteralPath $publishedSetup -Destination $setup
 Write-HashFile -Path $setup
 Invoke-PackagedExecutable -Path $setup -Arguments @('--self-test') -Description 'SpaceLens Setup packaged self-test'
 
+Invoke-DotNet -Arguments @(
+    'publish', $signerProject,
+    '-c', 'Release',
+    '-r', 'win-x64',
+    '--self-contained', 'true',
+    '-p:PublishAot=true',
+    '-p:DebugSymbols=false',
+    '-o', $signerPublish,
+    '--nologo'
+)
+$nativeSigner = Join-Path $signerPublish 'ReleaseSigner.exe'
+Assert-NativeReleaseSignerDirectory -ExecutablePath $nativeSigner
+$nativeSignerLock = Open-VerifiedReleaseExecutable -Path $nativeSigner
+try {
+    Invoke-LockedReleaseSigner -Lock $nativeSignerLock -Arguments @('self-test')
+    $nativeSignerHash = $nativeSignerLock.Sha256
+}
+finally { $nativeSignerLock.Stream.Dispose() }
+[IO.File]::WriteAllText(
+    (Join-Path $intermediate 'ReleaseSigner.exe.sha256'),
+    "$nativeSignerHash  ReleaseSigner.exe`r`n",
+    [Text.Encoding]::ASCII
+)
+
 Copy-Item -LiteralPath $releaseNotes -Destination (Join-Path $package 'RELEASE-NOTES.md')
 
 $setupInfo = Get-Item -LiteralPath $setup
 $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToUpperInvariant()
 $unsignedManifest = Join-Path $intermediate 'update.unsigned.json'
-$signedManifest = Join-Path $package 'update.json'
 $manifest = [ordered]@{
     schemaVersion = 1
     version = $Version
@@ -264,82 +281,68 @@ $manifest = [ordered]@{
 $manifestJson = $manifest | ConvertTo-Json
 [IO.File]::WriteAllText($unsignedManifest, $manifestJson + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 
-if (-not $SigningKey) {
-    Write-Warning "Unsigned build and packaged self-tests succeeded. Intermediate files are in $intermediate; no final release directory was created."
+if (-not $PrepareOfflineRelease) {
+    Write-Host "Unsigned build and packaged self-tests succeeded. Intermediate files are in $intermediate." -ForegroundColor Green
     return
 }
 
-Invoke-DotNet -Arguments @('run', '--project', $signerProject, '-c', 'Release', '--', 'sign', $resolvedKey, $unsignedManifest, $signedManifest)
-Invoke-DotNet -Arguments @('run', '--project', $signerProject, '-c', 'Release', '--', 'verify', $publicKey, $signedManifest)
-Invoke-PackagedExecutable `
-    -Path $app `
-    -Arguments @('--verify-update-manifest', $signedManifest, '--installer', $setup) `
-    -Description 'SpaceLens production update verifier'
+$postBuildProvenance = Get-CleanReleaseProvenance -Repository $repository
+if (-not [string]::Equals($postBuildProvenance.Commit, $sourceProvenance.Commit, [StringComparison]::Ordinal)) {
+    throw 'The source commit changed while release inputs were being built.'
+}
 
-$postBuildChanges = @(& git -c $gitSafety -C $repository status --porcelain=v1 --untracked-files=all)
-if ($LASTEXITCODE -ne 0 -or $postBuildChanges.Count -ne 0) { throw 'The source tree changed while the signed release was building.' }
-$postBuildCommit = (& git -c $gitSafety -C $repository rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($postBuildCommit, $sourceCommit, [StringComparison]::OrdinalIgnoreCase)) { throw 'The source commit changed while the signed release was building.' }
-
-$expectedReleaseAssets = @(
+$preparedDirectory = Join-Path $intermediate 'prepared-release'
+New-Item -ItemType Directory -Path $preparedDirectory | Out-Null
+$preparedInputNames = @(
     'RELEASE-NOTES.md',
     'SpaceLens-Setup.exe',
     'SpaceLens-Setup.exe.sha256',
     'SpaceLens.exe',
     'SpaceLens.exe.sha256',
-    'update.json'
+    'update.unsigned.json'
 ) | Sort-Object
-$releaseStaging = Get-OwnedChildPath -Path (Join-Path $releaseRoot (".$Version-" + [Guid]::NewGuid().ToString('N') + '.staging')) -Parent $releaseRoot
-$previousRelease = ''
-try {
-    New-Item -ItemType Directory -Path $releaseStaging | Out-Null
-    foreach ($assetName in $expectedReleaseAssets) {
-        Copy-Item -LiteralPath (Join-Path $package $assetName) -Destination (Join-Path $releaseStaging $assetName)
-    }
 
-    Assert-HashFile -Path (Join-Path $releaseStaging 'SpaceLens.exe')
-    Assert-HashFile -Path (Join-Path $releaseStaging 'SpaceLens-Setup.exe')
-
-    $actualEntries = @(Get-ChildItem -LiteralPath $releaseStaging -Force)
-    if (@($actualEntries | Where-Object { $_.PSIsContainer }).Count -ne 0) {
-        throw 'The staged release unexpectedly contains a subdirectory.'
-    }
-    $actualReleaseAssets = @($actualEntries | ForEach-Object Name | Sort-Object)
-    $assetDifference = @(Compare-Object -ReferenceObject $expectedReleaseAssets -DifferenceObject $actualReleaseAssets -CaseSensitive)
-    if ($assetDifference.Count -ne 0) {
-        throw "The staged release does not contain exactly the six expected assets: $($assetDifference | Out-String)"
-    }
-
-    if (Test-Path -LiteralPath $releaseDirectory) {
-        $resolvedReleaseDirectory = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $releaseDirectory).Path)
-        [void](Get-OwnedChildPath -Path $resolvedReleaseDirectory -Parent $releaseRoot)
-        $previousRelease = Get-OwnedChildPath -Path (Join-Path $releaseRoot (".$Version-" + [Guid]::NewGuid().ToString('N') + '.previous')) -Parent $releaseRoot
-        Move-Item -LiteralPath $resolvedReleaseDirectory -Destination $previousRelease
-    }
-    try {
-        [void](Get-OwnedChildPath -Path $releaseStaging -Parent $releaseRoot)
-        [void](Get-OwnedChildPath -Path $releaseDirectory -Parent $releaseRoot)
-        Move-Item -LiteralPath $releaseStaging -Destination $releaseDirectory
-    }
-    catch {
-        if ($previousRelease -and (Test-Path -LiteralPath $previousRelease) -and -not (Test-Path -LiteralPath $releaseDirectory)) {
-            [void](Get-OwnedChildPath -Path $previousRelease -Parent $releaseRoot)
-            Move-Item -LiteralPath $previousRelease -Destination $releaseDirectory
-        }
-        throw
-    }
-    if ($previousRelease -and (Test-Path -LiteralPath $previousRelease)) {
-        $resolvedPrevious = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $previousRelease).Path)
-        [void](Get-OwnedChildPath -Path $resolvedPrevious -Parent $releaseRoot)
-        Remove-Item -LiteralPath $resolvedPrevious -Recurse -Force
-    }
-}
-finally {
-    if (Test-Path -LiteralPath $releaseStaging) {
-        $resolvedStaging = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $releaseStaging).Path)
-        [void](Get-OwnedChildPath -Path $resolvedStaging -Parent $releaseRoot)
-        Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
-    }
+foreach ($name in $preparedInputNames) {
+    $source = if ($name -eq 'update.unsigned.json') { $unsignedManifest } else { Join-Path $package $name }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $preparedDirectory $name)
 }
 
-Write-Host "Signed and production-verified release v$Version from $sourceCommit is ready in $releaseDirectory" -ForegroundColor Green
+$inputRecords = @($preparedInputNames | ForEach-Object {
+    Get-ReleaseFileRecord -Path (Join-Path $preparedDirectory $_)
+})
+$provenance = [ordered]@{
+    schemaVersion = 1
+    product = 'SpaceLens'
+    version = $Version
+    sourceRepository = 'https://github.com/Purxy8/SpaceLens'
+    sourceCommit = $sourceProvenance.Commit
+    generatedUtc = (Get-Date).ToUniversalTime().ToString('O')
+    inputs = $inputRecords
+}
+[IO.File]::WriteAllText(
+    (Join-Path $preparedDirectory 'release-provenance.json'),
+    (($provenance | ConvertTo-Json -Depth 5) + [Environment]::NewLine),
+    [Text.UTF8Encoding]::new($false)
+)
+
+$preparedZip = Join-Path $intermediate "SpaceLens-release-input-v$Version.zip"
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::CreateFromDirectory(
+    $preparedDirectory,
+    $preparedZip,
+    [IO.Compression.CompressionLevel]::Optimal,
+    $false
+)
+$preparedDigest = (Get-FileHash -LiteralPath $preparedZip -Algorithm SHA256).Hash.ToUpperInvariant()
+[IO.File]::WriteAllText("$preparedZip.sha256", "$preparedDigest  $([IO.Path]::GetFileName($preparedZip))`r`n", [Text.Encoding]::ASCII)
+
+$finalProvenance = Get-CleanReleaseProvenance -Repository $repository
+if (-not [string]::Equals($finalProvenance.Commit, $sourceProvenance.Commit, [StringComparison]::Ordinal)) {
+    throw 'The source commit changed while the prepared release archive was being created.'
+}
+
+Write-Host "Prepared and self-tested release inputs for v$Version from $($sourceProvenance.Commit):" -ForegroundColor Green
+Write-Host $preparedZip
+Write-Host "SHA-256: $preparedDigest"
+Write-Host 'Finalize on the offline signing machine with Finalize-Release.ps1. Build-Release.ps1 never accesses a private key.'
