@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added truthful privacy documentation plus install-time and in-app controls for automatic GitHub update checks; scan results and file information remain local.
+- Prepared SignPath Foundation code signing with public policy/roles, metadata-restricted artifact configurations, code ownership, and a safety-locked two-stage GitHub-hosted workflow pending onboarding and full-SHA action pinning.
+- Added an offline finalizer that verifies the workflow artifact ZIP digest, run/ref and source commit, signing-request IDs, hashes, product metadata, Authenticode signatures, and timestamps before signing the existing update manifest and assembling release assets.
+
 ## 1.5.0 — 2026-07-12
 
 - Fixed the Full access UAC helper disconnect by keeping `CurrentUserOnly` on the protected pipe server while removing the incompatible elevated-client owner check; startup errors now return useful diagnostics instead of a generic closed-connection message.

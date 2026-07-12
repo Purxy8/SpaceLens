@@ -43,11 +43,19 @@ internal static class UpdateService
     private const string AssetName = "SpaceLens-Setup.exe";
     private const string FeedUrl = "https://github.com/Purxy8/SpaceLens/releases/latest/download/update.json";
     internal const string ReleasePage = "https://github.com/Purxy8/SpaceLens/releases";
+    internal const string PrivacyPage = "https://github.com/Purxy8/SpaceLens/blob/main/PRIVACY.md";
     private const long MaximumInstallerBytes = 250L * 1024 * 1024;
     private const int MaximumManifestBytes = 64 * 1024;
     private const int MaximumStateBytes = 4 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
+    private static readonly object StateGate = new();
     private static string StatePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpaceLens", "update-state.json");
+
+    private sealed class UpdateState
+    {
+        public DateTimeOffset? LastAutomaticAttemptUtc { get; set; }
+        public bool AutomaticChecksEnabled { get; set; }
+    }
 
     private static string ResolveCurrentVersion()
     {
@@ -57,21 +65,72 @@ internal static class UpdateService
         return value;
     }
 
+    internal static bool AutomaticChecksEnabled()
+    {
+        lock (StateGate) return ReadState().AutomaticChecksEnabled;
+    }
+
     internal static bool AutomaticCheckIsDue()
     {
-        try { using var file = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete); if (file.Length > MaximumStateBytes) return true; using var doc = JsonDocument.Parse(file); DateTimeOffset last = doc.RootElement.GetProperty("lastAutomaticAttemptUtc").GetDateTimeOffset(); TimeSpan age = DateTimeOffset.UtcNow - last; return age < TimeSpan.Zero || age >= TimeSpan.FromHours(24); } catch { return true; }
+        lock (StateGate)
+        {
+            UpdateState state = ReadState();
+            if (!state.AutomaticChecksEnabled) return false;
+            if (state.LastAutomaticAttemptUtc is not DateTimeOffset last) return true;
+            TimeSpan age = DateTimeOffset.UtcNow - last;
+            return age < TimeSpan.Zero || age >= TimeSpan.FromHours(24);
+        }
     }
 
     internal static void RecordAutomaticAttempt()
     {
-        try { Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!); string temp = StatePath + ".tmp"; File.WriteAllText(temp, JsonSerializer.Serialize(new { lastAutomaticAttemptUtc = DateTimeOffset.UtcNow }, JsonOptions)); File.Move(temp, StatePath, true); } catch { }
+        lock (StateGate)
+        {
+            try { UpdateState state = ReadState(); state.LastAutomaticAttemptUtc = DateTimeOffset.UtcNow; WriteState(state); } catch { }
+        }
+    }
+
+    internal static void SetAutomaticChecksEnabled(bool enabled)
+    {
+        lock (StateGate)
+        {
+            UpdateState state = ReadState();
+            state.AutomaticChecksEnabled = enabled;
+            WriteState(state);
+        }
+    }
+
+    private static UpdateState ReadState()
+    {
+        try
+        {
+            using var file = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            if (file.Length <= 0 || file.Length > MaximumStateBytes) return new UpdateState();
+            return JsonSerializer.Deserialize<UpdateState>(file, JsonOptions) ?? new UpdateState();
+        }
+        catch { return new UpdateState(); }
+    }
+
+    private static void WriteState(UpdateState state)
+    {
+        string directory = Path.GetDirectoryName(StatePath)!;
+        Directory.CreateDirectory(directory);
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
+        if (json.Length > MaximumStateBytes) throw new InvalidDataException("The update preference file is too large.");
+        string temp = Path.Combine(directory, $".update-state-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { file.Write(json); file.Flush(true); }
+            File.Move(temp, StatePath, true);
+        }
+        finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
     }
 
     internal static async Task<UpdateManifest?> CheckAsync(CancellationToken token)
     {
         using HttpClient client = CreateClient(); using var response = await client.GetAsync(FeedUrl, HttpCompletionOption.ResponseHeadersRead, token); response.EnsureSuccessStatusCode(); ValidateFinalTransport(response.RequestMessage?.RequestUri);
         if (response.Content.Headers.ContentLength is > MaximumManifestBytes) throw new InvalidDataException("The update manifest is too large."); await using Stream manifestStream = await response.Content.ReadAsStreamAsync(token); byte[] bytes = await ReadBoundedAsync(manifestStream, MaximumManifestBytes, token);
-        UpdateManifest manifest = ParseAndValidate(bytes); if (!SemanticVersion.TryParse(CurrentVersionText, out var current)) throw new InvalidOperationException("The installed application version is invalid."); SemanticVersion.TryParse(manifest.Version, out var available); return available.CompareTo(current) > 0 ? manifest : null;
+        UpdateManifest manifest = ParseAndValidate(bytes); if (!SemanticVersion.TryParse(CurrentVersionText, out var current)) throw new InvalidOperationException("The installed application version is invalid."); if (!SemanticVersion.TryParse(manifest.Version, out var available)) throw new InvalidDataException("The update version is invalid."); return available.CompareTo(current) > 0 ? manifest : null;
     }
 
     internal static UpdateManifest ParseAndValidate(ReadOnlyMemory<byte> json)
@@ -180,5 +239,5 @@ internal sealed class UpdateProgressForm : Form
         Controls.Add(cancel); Controls.Add(bar); Controls.Add(message);
     }
     internal void MarkComplete() => complete = true;
-    private static string Format(long bytes) => ByteFormatter.Format(bytes);
+    private static string Format(long bytes) => ByteFormatter.Format(bytes, CultureInfo.CurrentCulture);
 }

@@ -107,6 +107,8 @@ internal sealed class AnalyzerForm : Form
     private readonly ModernButton deleteButton = MakeButton("Recycle selected", Color.FromArgb(205, 53, 47), Color.White);
     private readonly ModernButton browseButton = MakeButton("Browse…", Color.FromArgb(226, 233, 242), AppTheme.Text);
     private readonly ModernButton updateButton = MakeButton("Check for updates", Color.FromArgb(49, 67, 91), Color.White);
+    private readonly ContextMenuStrip updateMenu = new();
+    private readonly ToolStripMenuItem automaticUpdateMenuItem = new("Check automatically once a day") { CheckOnClick = true, Checked = UpdateService.AutomaticChecksEnabled() };
     private readonly CheckBox fullAccessScan = new() { Text = "Full access scan (Administrator)", AutoSize = true, Checked = true, ForeColor = Color.FromArgb(72, 85, 105), Margin = new Padding(14, 1, 0, 0) };
     private readonly TextBox search = new() { PlaceholderText = "Search scanned files…", Dock = DockStyle.Fill };
     private readonly DataGridView filesGrid = MakeGrid();
@@ -199,6 +201,15 @@ internal sealed class AnalyzerForm : Form
 
         scanButton.Click += async (_, _) => await StartScanAsync(); stopButton.Click += (_, _) => cancellation?.Cancel(); deleteButton.Click += async (_, _) => await RecycleSelectedAsync();
         updateButton.AutoSize = false; updateButton.Size = new Size(154, 34); updateButton.Click += async (_, _) => { if (recycleBusy) return; if (updateButton.Tag is UpdateManifest manifest && cancellation is null && !cacheLoading) await UpdateService.OfferAndInstallAsync(this, manifest); else await CheckForUpdatesAsync(true); };
+        automaticUpdateMenuItem.CheckedChanged += AutomaticUpdatePreferenceChanged;
+        updateMenu.Items.Add(automaticUpdateMenuItem);
+        updateMenu.Items.Add(new ToolStripSeparator());
+        updateMenu.Items.Add("Privacy information", null, (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(UpdateService.PrivacyPage) { UseShellExecute = true }); }
+            catch (Exception ex) { MessageBox.Show(this, $"SpaceLens could not open the privacy page.\n\n{ex.Message}", "Could not open link", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        });
+        updateButton.ContextMenuStrip = updateMenu;
         search.TextChanged += (_, _) => { searchTimer.Stop(); if (!recycleBusy && cancellation is null && !cacheLoading) searchTimer.Start(); }; searchTimer.Tick += (_, _) => { searchTimer.Stop(); if (!recycleBusy && cancellation is null && !cacheLoading) PopulateResults(false); };
         categoryFilter.SelectedIndexChanged += (_, _) => { if (!recycleBusy && !updatingCategories) { activeCategory = categoryFilter.SelectedItem?.ToString() ?? "All files"; HighlightCategory(activeCategory); PopulateResults(false); } };
         mediaFilter.SelectedIndexChanged += (_, _) => { if (!recycleBusy) { activeMedia = mediaFilter.SelectedItem?.ToString() ?? "All types"; PopulateResults(false); } };
@@ -262,10 +273,28 @@ internal sealed class AnalyzerForm : Form
         tips.SetToolTip(driveFree, "For a current complete drive scan, this is the free-space snapshot captured with that scan. Run Scan now to refresh it.");
         tips.SetToolTip(metrics, "SpaceLens uses decimal display units: 1 KB = 1,000 bytes, 1 MB = 1,000,000 bytes, and 1 GB = 1,000,000,000 bytes.");
         tips.SetToolTip(fullAccessScan, "Uses a scan-only, short-lived Administrator helper with Windows backup privilege on local fixed drives. Cleanup stays unelevated, ownership and permissions never change, and filesystem-managed storage can still remain in System / protected.");
+        tips.SetToolTip(updateButton, "Checks the official GitHub release feed. Right-click to turn automatic daily checks on or off and to view privacy information.");
         UpdateDriveMetrics();
         Shown += async (_, _) => { await LoadCachedAsync(location.Text); if (UpdateService.AutomaticCheckIsDue()) _ = CheckForUpdatesAsync(false); };
         FormClosing += (_, e) => { if (recycleBusy) { e.Cancel = true; MessageBox.Show(this, "SpaceLens is still finishing the Recycle Bin operation and saving the updated scan. Please wait for it to finish before closing the app.", "Cleanup is still running", MessageBoxButtons.OK, MessageBoxIcon.Information); } };
-        FormClosed += (_, _) => { cancellation?.Cancel(); viewCancellation?.Cancel(); cacheLoadCancellation?.Cancel(); updateCancellation?.Cancel(); searchTimer.Stop(); searchTimer.Dispose(); tips.Dispose(); safetyFont.Dispose(); };
+        FormClosed += (_, _) => { cancellation?.Cancel(); viewCancellation?.Cancel(); cacheLoadCancellation?.Cancel(); updateCancellation?.Cancel(); searchTimer.Stop(); searchTimer.Dispose(); updateMenu.Dispose(); tips.Dispose(); safetyFont.Dispose(); };
+    }
+
+    private void AutomaticUpdatePreferenceChanged(object? sender, EventArgs e)
+    {
+        try
+        {
+            UpdateService.SetAutomaticChecksEnabled(automaticUpdateMenuItem.Checked);
+            if (!automaticUpdateMenuItem.Checked) updateCancellation?.Cancel();
+            status.Text = automaticUpdateMenuItem.Checked ? "Automatic update checks are enabled (at most once per day)." : "Automatic update checks are off. Use Check for updates whenever you want.";
+        }
+        catch (Exception ex)
+        {
+            automaticUpdateMenuItem.CheckedChanged -= AutomaticUpdatePreferenceChanged;
+            automaticUpdateMenuItem.Checked = !automaticUpdateMenuItem.Checked;
+            automaticUpdateMenuItem.CheckedChanged += AutomaticUpdatePreferenceChanged;
+            MessageBox.Show(this, $"SpaceLens could not save the update preference.\n\n{ex.Message}", "Preference not saved", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private async Task LoadCachedAsync(string root)

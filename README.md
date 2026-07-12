@@ -2,7 +2,7 @@
 
 SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder, explains where the used space is going, and lets you review individual files before sending them to the Recycle Bin.
 
-[Download the latest installer](https://github.com/Purxy8/SpaceLens/releases/latest/download/SpaceLens-Setup.exe) · [View all releases](https://github.com/Purxy8/SpaceLens/releases)
+[Download the latest installer](https://github.com/Purxy8/SpaceLens/releases/latest/download/SpaceLens-Setup.exe) · [View all releases](https://github.com/Purxy8/SpaceLens/releases) · [Privacy](PRIVACY.md) · [Code signing policy](CODE_SIGNING_POLICY.md) · [Security](SECURITY.md)
 
 ## Highlights
 
@@ -17,7 +17,7 @@ SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder,
 - Visible Normal, Important, and Protected safety notes plus a dedicated protected-item filter
 - Validated completed-scan caching so the last results can be restored without rescanning at every launch
 - Recycle Bin deletion only, with file-identity and stale-file validation plus stronger confirmation for sensitive locations
-- Signed update manifests, bounded downloads, exact size and SHA-256 checks, and a pinned GitHub release source
+- Signed update manifests, bounded downloads, exact size and SHA-256 checks, a pinned GitHub release source, and user-controlled automatic update checks
 - Upgrade-safe per-user installer with Desktop/Start Menu shortcuts, rollback, and Apps & Features uninstall support
 
 ## Understanding scan totals
@@ -37,10 +37,12 @@ The elevated helper is scan-only; the main cleanup interface stays unelevated. A
 On Windows 10 or 11 (64-bit):
 
 1. Download `SpaceLens-Setup.exe` from the latest release.
-2. Run it and optionally create a Desktop shortcut.
+2. Run it, review the privacy link and automatic-update option, and optionally create a Desktop shortcut.
 3. Start SpaceLens, select a folder on a local fixed drive, leave **Full access scan (Administrator)** enabled for broader protected-location coverage, and choose **Scan now**. Approve the Windows UAC prompt with the same Windows account. SpaceLens resolves directory-link roots to their canonical fixed-drive location; clear the option for network shares, removable drives, or a standard scan.
 
-The release also contains a portable `SpaceLens.exe` that runs without installation. The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning.
+The release also contains a portable `SpaceLens.exe` that runs without installation. With no preference already saved for the same Windows account, a portable copy starts with automatic checks off; right-click **Check for updates** to enable or disable the at-most-daily automatic check. Installed and portable copies share that per-account preference. See the [privacy policy](PRIVACY.md) for the exact network behavior.
+
+The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning. The project is preparing for SignPath Foundation signing; the [code signing policy](CODE_SIGNING_POLICY.md) records the status, roles, provenance controls, and verification procedure without claiming that older unsigned binaries are signed. Even a future correctly signed build can initially receive a SmartScreen reputation warning while the new application establishes reputation.
 
 SpaceLens 1.5 uses a smaller and more strongly validated v6 cache and can migrate v5, v4, and v3 saved scans from earlier releases. Run one fresh full-access scan after upgrading for the most accurate current accounting.
 
@@ -52,7 +54,7 @@ Install the .NET 10 SDK on Windows, then run:
 pwsh -File .\scripts\Build-Release.ps1
 ```
 
-The version is read from `Directory.Build.props`. Unsigned local build outputs are written to `artifacts/intermediate/`; no publishable release folder is created without the offline ECDSA signing key. A signed, production-verified release contains exactly six upload assets in `artifacts/release/VERSION/`. See [docs/PUBLISHING.md](docs/PUBLISHING.md).
+The version is read from `Directory.Build.props`. Unsigned local build outputs are written to `artifacts/intermediate/`; no publishable release folder is created without the offline ECDSA update-manifest key. A manifest-signed, production-verified release contains exactly six upload assets in `artifacts/release/VERSION/`; Authenticode releases additionally follow the separate SignPath workflow. See [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
 ## Project layout
 
@@ -60,6 +62,9 @@ The version is read from `Directory.Build.props`. Unsigned local build outputs a
 - `src/SpaceLens.Setup` — per-user Windows installer and uninstaller
 - `tools/ReleaseSigner` — manifest signing and verification utility
 - `scripts/Build-Release.ps1` — reproducible build, package, self-test, and hash workflow
+- `scripts/Build-SignPathRelease.ps1` — staged GitHub build for the two SignPath signing requests
+- `scripts/Finalize-SignPathRelease.ps1` — offline provenance verification and final signed-update packaging
+- `signpath` — versioned, metadata-restricted SignPath artifact configurations
 - `release-notes` — release history supplied with GitHub releases
 
 ## License
