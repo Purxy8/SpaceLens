@@ -2,7 +2,7 @@
 
 ## Current status
 
-SpaceLens is preparing to apply for the SignPath Foundation open-source signing service. Until acceptance and the first signed release, the GitHub release notes will explicitly identify binaries as unsigned. No existing unsigned file is represented as signed.
+SpaceLens has submitted an application to the SignPath Foundation open-source signing service and is awaiting acceptance. Until acceptance and the first signed release, GitHub release notes explicitly identify binaries as unsigned. No existing unsigned file is represented as signed.
 
 For releases produced after acceptance:
 

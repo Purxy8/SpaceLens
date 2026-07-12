@@ -12,8 +12,8 @@ SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder,
 - Allocated size on disk for sparse and compressed files, with honest approximation markers when Windows cannot report allocation
 - Categories for downloads, temporary files and caches, apps and games, Windows/system files, and personal files, plus independent screenshot and video filters
 - Category, media, search, and size sorting controls that remain independent and composable
-- Fast buffered Windows directory scanning with live files-per-second feedback, cancellation, background filtering/sorting, and a virtualized largest-files table
-- Optional **Full access scan (Administrator)** for local fixed drives, using a short-lived authenticated helper with Windows backup privilege for broader protected-location coverage
+- Fast extended Windows directory scanning with direct file IDs/reparse tags, live files-per-second feedback, cancellation, background filtering/sorting, and a virtualized largest-files table
+- Optional **Full access / NTFS refresh (Administrator)** for local fixed drives, using a short-lived authenticated helper for broader protected coverage plus a choice between journal-based closed-file refresh and a complete rescan
 - Visible Normal, Important, and Protected safety notes plus a dedicated protected-item filter
 - Validated completed-scan caching so the last results can be restored without rescanning at every launch
 - Recycle Bin deletion only, with file-identity and stale-file validation plus stronger confirmation for sensitive locations
@@ -38,13 +38,13 @@ On Windows 10 or 11 (64-bit):
 
 1. Download `SpaceLens-Setup.exe` from the latest release.
 2. Run it, review the privacy link and automatic-update option, and optionally create a Desktop shortcut.
-3. Start SpaceLens, select a folder on a local fixed drive, leave **Full access scan (Administrator)** enabled for broader protected-location coverage, and choose **Scan now**. Approve the Windows UAC prompt with the same Windows account. SpaceLens resolves directory-link roots to their canonical fixed-drive location; clear the option for network shares, removable drives, or a standard scan.
+3. Start SpaceLens, select a drive or folder, and choose **Scan now** for the faster standard Quick scan. Enable **Full access / NTFS refresh (Administrator)** when protected-location coverage is needed and approve the Windows UAC prompt with the same Windows account. After one saved full-access scan of an entire NTFS drive, SpaceLens offers a Fast NTFS refresh or a Complete rescan. Fast refresh follows closed-file journal changes and falls back when Windows exposes uncertainty; choose Complete rescan whenever continuously open logs/databases or an exact newly rebuilt snapshot matter.
 
 The release also contains a portable `SpaceLens.exe` that runs without installation. With no preference already saved for the same Windows account, a portable copy starts with automatic checks off; right-click **Check for updates** to enable or disable the at-most-daily automatic check. Installed and portable copies share that per-account preference. See the [privacy policy](PRIVACY.md) for the exact network behavior.
 
 The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning. The project is preparing for SignPath Foundation signing; the [code signing policy](CODE_SIGNING_POLICY.md) records the status, roles, provenance controls, and verification procedure without claiming that older unsigned binaries are signed. Even a future correctly signed build can initially receive a SmartScreen reputation warning while the new application establishes reputation.
 
-SpaceLens 1.5 uses a smaller and more strongly validated v6 cache and can migrate v5, v4, and v3 saved scans from earlier releases. Run one fresh full-access scan after upgrading for the most accurate current accounting.
+SpaceLens 1.6 uses a validated v7 cache with an optional NTFS change-journal checkpoint and can migrate v6, v5, v4, and v3 saved scans from earlier releases. Run one fresh whole-drive full-access scan after upgrading to enable later NTFS Quick Refresh.
 
 ## Build from source
 

@@ -37,14 +37,16 @@ internal sealed class GradientHeaderPanel : Panel
 
 internal sealed class ActivityStrip : Control
 {
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 65 };
+    // A subtle ~11 FPS sweep is visually smooth at four pixels high while
+    // leaving more UI-thread budget for virtual-grid scrolling and filtering.
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 90 };
     private float position;
     private bool active;
 
     internal ActivityStrip()
     {
         DoubleBuffered = true; SetStyle(ControlStyles.ResizeRedraw, true); Height = 4; TabStop = false;
-        timer.Tick += (_, _) => { position += 0.055f; if (position > 1.2f) position = -0.25f; Invalidate(); };
+        timer.Tick += (_, _) => { position += 0.075f; if (position > 1.2f) position = -0.25f; if (IsHandleCreated && Visible) Invalidate(); };
     }
 
     internal void SetActive(bool value)

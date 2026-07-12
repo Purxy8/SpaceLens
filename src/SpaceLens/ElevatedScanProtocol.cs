@@ -11,11 +11,62 @@ internal enum ElevatedScanFrameType : byte
     Completed = 3,
     Error = 4,
     Ready = 5,
+    Removed = 6,
+    RefreshCompleted = 7,
+    RefreshFallback = 8,
     Start = 10,
-    Cancel = 11
+    Cancel = 11,
+    RefreshStart = 12
 }
 
-internal readonly record struct ElevatedScanFrame(ElevatedScanFrameType Type, byte[] Body);
+internal readonly record struct ElevatedRefreshCompletion(
+    NtfsJournalCheckpoint Checkpoint,
+    int JournalRecords,
+    int Upserts,
+    int Removed);
+
+/// <summary>
+/// Owns one received protocol body. Large bodies are rented so full-access scans
+/// do not allocate a new large-object-heap array for every file batch.
+/// </summary>
+internal sealed class ElevatedScanFrame : IDisposable
+{
+    private byte[]? buffer;
+    private readonly int bodyLength;
+    private readonly bool pooled;
+
+    internal ElevatedScanFrame(ElevatedScanFrameType type, byte[] body, int length, bool pooledBody)
+    {
+        if (length < 0 || length > body.Length) throw new ArgumentOutOfRangeException(nameof(length));
+        Type = type;
+        buffer = body;
+        bodyLength = length;
+        pooled = pooledBody;
+    }
+
+    internal ElevatedScanFrameType Type { get; }
+
+    internal ReadOnlySpan<byte> Body
+    {
+        get
+        {
+            byte[] value = Volatile.Read(ref buffer) ?? throw new ObjectDisposedException(nameof(ElevatedScanFrame));
+            return value.AsSpan(0, bodyLength);
+        }
+    }
+
+    internal void ClearBody()
+    {
+        byte[] value = Volatile.Read(ref buffer) ?? throw new ObjectDisposedException(nameof(ElevatedScanFrame));
+        value.AsSpan(0, bodyLength).Clear();
+    }
+
+    public void Dispose()
+    {
+        byte[]? value = Interlocked.Exchange(ref buffer, null);
+        if (pooled && value is not null) ArrayPool<byte>.Shared.Return(value);
+    }
+}
 
 /// <summary>
 /// Small, bounded binary protocol used between the ordinary UI process and the
@@ -24,63 +75,90 @@ internal readonly record struct ElevatedScanFrame(ElevatedScanFrameType Type, by
 /// </summary>
 internal static class ElevatedScanProtocol
 {
-    internal const int Version = 3;
+    internal const int Version = 4;
     internal const int NonceLength = 32;
     internal const int MaximumTotalFiles = 10_000_000;
 
+    private const int FrameHeaderLength = sizeof(int) + sizeof(byte);
     private const int MaximumFrameLength = 8 * 1024 * 1024;
     private const int MaximumFrameBodyLength = MaximumFrameLength - 1;
     private const int MaximumBatchItems = 8_000;
     private const int MaximumRecordLength = 256 * 1024;
     private const int MaximumPathBytes = 128 * 1024;
     private const int MaximumErrorBytes = 16 * 1024;
+    private const int FixedRecordBytes = 55;
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private static readonly ArrayPool<byte> FrameBufferPool = ArrayPool<byte>.Create(MaximumFrameBodyLength, 1);
 
     internal static async Task WriteHelloAsync(Stream stream, byte[] nonce, CancellationToken token)
     {
         if (nonce.Length != NonceLength) throw new ArgumentException("The scan nonce has an invalid length.", nameof(nonce));
-        using var body = new MemoryStream(4 + NonceLength);
-        using (var writer = new BinaryWriter(body, Utf8, true))
-        {
-            writer.Write(Version);
-            writer.Write(nonce);
-        }
-        await WriteFrameAsync(stream, ElevatedScanFrameType.Hello, body.ToArray(), token).ConfigureAwait(false);
+        byte[] body = new byte[sizeof(int) + NonceLength];
+        BinaryPrimitives.WriteInt32LittleEndian(body, Version);
+        nonce.CopyTo(body.AsSpan(sizeof(int)));
+        await WriteFrameAsync(stream, ElevatedScanFrameType.Hello, body, token).ConfigureAwait(false);
     }
 
     internal static byte[] ReadHello(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Hello);
-        if (frame.Body.Length != 4 + NonceLength) throw Invalid("The helper handshake has an invalid length.");
-        using var body = new MemoryStream(frame.Body, false);
-        using var reader = new BinaryReader(body, Utf8, true);
-        if (reader.ReadInt32() != Version) throw Invalid("The elevated scan protocol version is not supported.");
-        byte[] nonce = reader.ReadBytes(NonceLength);
-        EnsureConsumed(body);
-        return nonce;
+        ReadOnlySpan<byte> body = frame.Body;
+        if (body.Length != sizeof(int) + NonceLength) throw Invalid("The helper handshake has an invalid length.");
+        if (BinaryPrimitives.ReadInt32LittleEndian(body) != Version) throw Invalid("The elevated scan protocol version is not supported.");
+        return body.Slice(sizeof(int), NonceLength).ToArray();
     }
 
     internal static async Task WriteStartAsync(Stream stream, string root, CancellationToken token)
     {
-        using var body = new MemoryStream();
-        using (var writer = new BinaryWriter(body, Utf8, true))
+        int rootBytes = GetBoundedUtf8ByteCount(root, MaximumPathBytes);
+        byte[] body = new byte[checked(sizeof(int) + sizeof(int) + rootBytes)];
         {
-            writer.Write(Version);
-            WriteBoundedString(writer, root, MaximumPathBytes);
+            var writer = new SpanWriter(body);
+            writer.WriteInt32(Version);
+            writer.WriteUtf8String(root, rootBytes);
         }
-        await WriteFrameAsync(stream, ElevatedScanFrameType.Start, body.ToArray(), token).ConfigureAwait(false);
+        await WriteFrameAsync(stream, ElevatedScanFrameType.Start, body, token).ConfigureAwait(false);
     }
 
     internal static string ReadStart(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Start);
-        using var body = new MemoryStream(frame.Body, false);
-        using var reader = new BinaryReader(body, Utf8, true);
+        var reader = new SpanReader(frame.Body);
         if (reader.ReadInt32() != Version) throw Invalid("The elevated scan protocol version is not supported.");
-        string root = ReadBoundedString(reader, MaximumPathBytes);
-        EnsureConsumed(body);
+        string root = reader.ReadUtf8String(MaximumPathBytes);
+        reader.EnsureConsumed();
         return root;
+    }
+
+    internal static async Task WriteRefreshStartAsync(Stream stream, string root, NtfsJournalCheckpoint checkpoint, long baselineDriveUsedBytes, CancellationToken token)
+    {
+        if (!checkpoint.IsValid) throw new ArgumentException("The quick-refresh checkpoint is invalid.", nameof(checkpoint));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(baselineDriveUsedBytes);
+        int rootBytes = GetBoundedUtf8ByteCount(root, MaximumPathBytes);
+        byte[] body = new byte[checked(sizeof(int) + sizeof(int) + rootBytes + sizeof(uint) + sizeof(ulong) + sizeof(long) + sizeof(long))];
+        {
+            var writer = new SpanWriter(body);
+            writer.WriteInt32(Version);
+            writer.WriteUtf8String(root, rootBytes);
+            writer.WriteUInt32(checkpoint.VolumeSerial);
+            writer.WriteUInt64(checkpoint.JournalId);
+            writer.WriteInt64(checkpoint.NextUsn);
+            writer.WriteInt64(baselineDriveUsedBytes);
+        }
+        await WriteFrameAsync(stream, ElevatedScanFrameType.RefreshStart, body, token).ConfigureAwait(false);
+    }
+
+    internal static (string Root, NtfsJournalCheckpoint Checkpoint, long BaselineDriveUsedBytes) ReadRefreshStart(ElevatedScanFrame frame)
+    {
+        RequireType(frame, ElevatedScanFrameType.RefreshStart);
+        var reader = new SpanReader(frame.Body);
+        if (reader.ReadInt32() != Version) throw Invalid("The elevated scan protocol version is not supported.");
+        string root = reader.ReadUtf8String(MaximumPathBytes);
+        var checkpoint = new NtfsJournalCheckpoint(reader.ReadUInt32(), reader.ReadUInt64(), reader.ReadInt64());
+        long baselineDriveUsedBytes = reader.ReadInt64();
+        reader.EnsureConsumed();
+        if (!checkpoint.IsValid || baselineDriveUsedBytes <= 0) throw Invalid("The quick-refresh request contains invalid baseline metadata.");
+        return (root, checkpoint, baselineDriveUsedBytes);
     }
 
     internal static async Task WriteBatchesAsync(
@@ -95,42 +173,16 @@ internal static class ElevatedScanProtocol
         byte[] rentedBuffer = FrameBufferPool.Rent(MaximumFrameBodyLength);
         try
         {
-            using var body = new MemoryStream(rentedBuffer, 0, rentedBuffer.Length, true, true);
             int itemIndex = 0;
             while (itemIndex < items.Count)
             {
-                body.SetLength(0);
-                body.Position = 0;
-                using var writer = new BinaryWriter(body, Utf8, true);
-                writer.Write(skipped);
-                long countPosition = body.Position;
-                writer.Write(0);
-                int frameItems = 0;
-
-                while (itemIndex < items.Count && frameItems < MaximumBatchItems)
-                {
-                    token.ThrowIfCancellationRequested();
-                    FileItem item = items[itemIndex];
-                    int recordLength = GetSerializedRecordLength(item);
-                    int nextLength = checked((int)body.Length + sizeof(int) + recordLength);
-                    if (frameItems > 0 && nextLength > MaximumFrameBodyLength) break;
-                    if (nextLength > MaximumFrameBodyLength) throw Invalid("A file record exceeds the elevated scan frame limit.");
-
-                    writer.Write(recordLength);
-                    long recordStart = body.Position;
-                    SerializeFileItem(writer, item);
-                    if (body.Position - recordStart != recordLength) throw Invalid("The elevated scan record length is inconsistent.");
-                    frameItems++;
-                    itemIndex++;
-                }
-
-                long end = body.Position;
-                body.Position = countPosition;
-                writer.Write(frameItems);
-                body.Position = end;
-                writer.Flush();
-                if (frameItems <= 0 || body.Length > MaximumFrameBodyLength) throw Invalid("The elevated scan batch is invalid.");
-                await WriteFrameAsync(stream, ElevatedScanFrameType.Batch, rentedBuffer.AsMemory(0, checked((int)body.Length)), token).ConfigureAwait(false);
+                int bodyLength = BuildBatchBody(rentedBuffer, items, ref itemIndex, skipped, token);
+                await WriteFrameAsync(
+                    stream,
+                    ElevatedScanFrameType.Batch,
+                    rentedBuffer.AsMemory(0, bodyLength),
+                    token,
+                    flush: false).ConfigureAwait(false);
             }
         }
         finally { FrameBufferPool.Return(rentedBuffer); }
@@ -139,8 +191,7 @@ internal static class ElevatedScanProtocol
     internal static (List<FileItem> Batch, int Skipped) ReadBatch(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Batch);
-        using var body = new MemoryStream(frame.Body, false);
-        using var reader = new BinaryReader(body, Utf8, true);
+        var reader = new SpanReader(frame.Body);
         int skipped = reader.ReadInt32();
         int count = reader.ReadInt32();
         if (skipped < 0 || count <= 0 || count > MaximumBatchItems) throw Invalid("The helper returned invalid batch metadata.");
@@ -149,33 +200,41 @@ internal static class ElevatedScanProtocol
         for (int index = 0; index < count; index++)
         {
             int recordLength = reader.ReadInt32();
-            if (recordLength <= 0 || recordLength > MaximumRecordLength || recordLength > body.Length - body.Position)
+            if (recordLength <= 0 || recordLength > MaximumRecordLength || recordLength > reader.Remaining)
                 throw Invalid("The helper returned an invalid file record length.");
-            int recordOffset = checked((int)body.Position);
-            using (var recordBody = new MemoryStream(frame.Body, recordOffset, recordLength, false, true))
-                files.Add(DeserializeFileItem(recordBody));
-            body.Position = checked(body.Position + recordLength);
+            files.Add(DeserializeFileItem(reader.ReadBytes(recordLength)));
         }
-        EnsureConsumed(body);
+        reader.EnsureConsumed();
         return (files, skipped);
     }
 
-    internal static Task WriteCompletedAsync(Stream stream, int skipped, bool backupPrivilegeEnabled, CancellationToken token)
+    internal static Task WriteCompletedAsync(Stream stream, int skipped, bool backupPrivilegeEnabled, CancellationToken token, NtfsJournalCheckpoint checkpoint = default)
     {
         if (skipped < 0) throw new ArgumentOutOfRangeException(nameof(skipped));
-        byte[] body = new byte[5];
-        BinaryPrimitives.WriteInt32LittleEndian(body, skipped);
-        body[4] = backupPrivilegeEnabled ? (byte)1 : (byte)0;
+        if (checkpoint != default && !checkpoint.IsValid) throw Invalid("The scan completion contains a partial NTFS journal checkpoint.");
+        byte[] body = new byte[26];
+        var writer = new SpanWriter(body);
+        writer.WriteInt32(skipped);
+        writer.WriteByte(backupPrivilegeEnabled ? (byte)1 : (byte)0);
+        writer.WriteByte(checkpoint.IsValid ? (byte)1 : (byte)0);
+        writer.WriteUInt32(checkpoint.IsValid ? checkpoint.VolumeSerial : 0);
+        writer.WriteUInt64(checkpoint.IsValid ? checkpoint.JournalId : 0);
+        writer.WriteInt64(checkpoint.IsValid ? checkpoint.NextUsn : 0);
         return WriteFrameAsync(stream, ElevatedScanFrameType.Completed, body, token);
     }
 
     internal static ElevatedScanResult ReadCompleted(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Completed);
-        if (frame.Body.Length != 5 || frame.Body[4] > 1) throw Invalid("The helper returned an invalid completion record.");
-        int skipped = BinaryPrimitives.ReadInt32LittleEndian(frame.Body);
+        var reader = new SpanReader(frame.Body);
+        int skipped = reader.ReadInt32();
+        byte backup = reader.ReadByte(), hasCheckpoint = reader.ReadByte();
+        var checkpoint = new NtfsJournalCheckpoint(reader.ReadUInt32(), reader.ReadUInt64(), reader.ReadInt64());
+        reader.EnsureConsumed();
+        if (backup > 1 || hasCheckpoint > 1 || (hasCheckpoint == 1) != checkpoint.IsValid || (hasCheckpoint == 0 && checkpoint != default))
+            throw Invalid("The elevated scanner returned an invalid completion record.");
         if (skipped < 0) throw Invalid("The helper returned a negative skipped-location count.");
-        return new(skipped, frame.Body[4] == 1);
+        return new(skipped, backup == 1, checkpoint);
     }
 
     internal static Task WriteReadyAsync(Stream stream, bool backupPrivilegeEnabled, CancellationToken token)
@@ -184,8 +243,9 @@ internal static class ElevatedScanProtocol
     internal static bool ReadReady(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Ready);
-        if (frame.Body.Length != 1 || frame.Body[0] > 1) throw Invalid("The elevated scanner returned an invalid ready record.");
-        return frame.Body[0] == 1;
+        ReadOnlySpan<byte> body = frame.Body;
+        if (body.Length != 1 || body[0] > 1) throw Invalid("The elevated scanner returned an invalid ready record.");
+        return body[0] == 1;
     }
 
     internal static Task WriteCancelAsync(Stream stream, CancellationToken token)
@@ -197,6 +257,95 @@ internal static class ElevatedScanProtocol
         if (frame.Body.Length != 0) throw Invalid("The cancel frame is malformed.");
     }
 
+    internal static async Task WriteRemovedAsync(Stream stream, IReadOnlyList<NativeFileId> removed, CancellationToken token)
+    {
+        int index = 0;
+        while (index < removed.Count)
+        {
+            int count = Math.Min(MaximumBatchItems, removed.Count - index);
+            byte[] body = new byte[checked(sizeof(int) + count * (sizeof(uint) + sizeof(ulong)))];
+            var writer = new SpanWriter(body);
+            writer.WriteInt32(count);
+            for (int offset = 0; offset < count; offset++)
+            {
+                NativeFileId id = removed[index++];
+                if (id.VolumeSerial == 0 || id.FileIndex == 0) throw Invalid("A removed-file identity is incomplete.");
+                writer.WriteUInt32(id.VolumeSerial);
+                writer.WriteUInt64(id.FileIndex);
+            }
+            await WriteFrameAsync(stream, ElevatedScanFrameType.Removed, body, token, flush: false).ConfigureAwait(false);
+        }
+    }
+
+    internal static List<NativeFileId> ReadRemoved(ElevatedScanFrame frame)
+    {
+        RequireType(frame, ElevatedScanFrameType.Removed);
+        var reader = new SpanReader(frame.Body);
+        int count = reader.ReadInt32();
+        if (count <= 0 || count > MaximumBatchItems) throw Invalid("The helper returned an invalid removed-file count.");
+        var removed = new List<NativeFileId>(count);
+        for (int index = 0; index < count; index++)
+        {
+            var id = new NativeFileId(reader.ReadUInt32(), reader.ReadUInt64());
+            if (id.VolumeSerial == 0 || id.FileIndex == 0) throw Invalid("The helper returned an incomplete removed-file identity.");
+            removed.Add(id);
+        }
+        reader.EnsureConsumed();
+        return removed;
+    }
+
+    internal static Task WriteRefreshCompletedAsync(Stream stream, ElevatedRefreshCompletion completion, CancellationToken token)
+    {
+        if (!completion.Checkpoint.IsValid || completion.JournalRecords < 0 || completion.Upserts < 0 || completion.Removed < 0)
+            throw Invalid("The quick-refresh completion metadata is invalid.");
+        byte[] body = new byte[32];
+        var writer = new SpanWriter(body);
+        writer.WriteUInt32(completion.Checkpoint.VolumeSerial);
+        writer.WriteUInt64(completion.Checkpoint.JournalId);
+        writer.WriteInt64(completion.Checkpoint.NextUsn);
+        writer.WriteInt32(completion.JournalRecords);
+        writer.WriteInt32(completion.Upserts);
+        writer.WriteInt32(completion.Removed);
+        return WriteFrameAsync(stream, ElevatedScanFrameType.RefreshCompleted, body, token);
+    }
+
+    internal static ElevatedRefreshCompletion ReadRefreshCompleted(ElevatedScanFrame frame)
+    {
+        RequireType(frame, ElevatedScanFrameType.RefreshCompleted);
+        var reader = new SpanReader(frame.Body);
+        var completion = new ElevatedRefreshCompletion(
+            new(reader.ReadUInt32(), reader.ReadUInt64(), reader.ReadInt64()),
+            reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32());
+        reader.EnsureConsumed();
+        if (!completion.Checkpoint.IsValid || completion.JournalRecords < 0 || completion.Upserts < 0 || completion.Removed < 0)
+            throw Invalid("The helper returned invalid quick-refresh completion metadata.");
+        return completion;
+    }
+
+    internal static async Task WriteRefreshFallbackAsync(Stream stream, string message, CancellationToken token)
+    {
+        if (message.Length > 4_096)
+        {
+            int length = 4_096;
+            if (char.IsHighSurrogate(message[length - 1])) length--;
+            message = message[..length];
+        }
+        int messageBytes = GetBoundedUtf8ByteCount(message, MaximumErrorBytes);
+        byte[] body = new byte[checked(sizeof(int) + messageBytes)];
+        var writer = new SpanWriter(body);
+        writer.WriteUtf8String(message, messageBytes);
+        await WriteFrameAsync(stream, ElevatedScanFrameType.RefreshFallback, body, token).ConfigureAwait(false);
+    }
+
+    internal static string ReadRefreshFallback(ElevatedScanFrame frame)
+    {
+        RequireType(frame, ElevatedScanFrameType.RefreshFallback);
+        var reader = new SpanReader(frame.Body);
+        string message = reader.ReadUtf8String(MaximumErrorBytes);
+        reader.EnsureConsumed();
+        return message;
+    }
+
     internal static async Task WriteErrorAsync(Stream stream, string message, CancellationToken token)
     {
         if (message.Length > 4_096)
@@ -205,35 +354,53 @@ internal static class ElevatedScanProtocol
             if (char.IsHighSurrogate(message[length - 1])) length--;
             message = message[..length];
         }
-        using var body = new MemoryStream();
-        using (var writer = new BinaryWriter(body, Utf8, true))
-            WriteBoundedString(writer, message, MaximumErrorBytes);
-        await WriteFrameAsync(stream, ElevatedScanFrameType.Error, body.ToArray(), token).ConfigureAwait(false);
+        int messageBytes = GetBoundedUtf8ByteCount(message, MaximumErrorBytes);
+        byte[] body = new byte[checked(sizeof(int) + messageBytes)];
+        {
+            var writer = new SpanWriter(body);
+            writer.WriteUtf8String(message, messageBytes);
+        }
+        await WriteFrameAsync(stream, ElevatedScanFrameType.Error, body, token).ConfigureAwait(false);
     }
 
     internal static string ReadError(ElevatedScanFrame frame)
     {
         RequireType(frame, ElevatedScanFrameType.Error);
-        using var body = new MemoryStream(frame.Body, false);
-        using var reader = new BinaryReader(body, Utf8, true);
-        string message = ReadBoundedString(reader, MaximumErrorBytes);
-        EnsureConsumed(body);
+        var reader = new SpanReader(frame.Body);
+        string message = reader.ReadUtf8String(MaximumErrorBytes);
+        reader.EnsureConsumed();
         return message;
     }
 
     internal static async Task<ElevatedScanFrame> ReadFrameAsync(Stream stream, CancellationToken token)
     {
-        byte[] header = new byte[sizeof(int)];
-        await ReadExactlyAsync(stream, header, token).ConfigureAwait(false);
-        int frameLength = BinaryPrimitives.ReadInt32LittleEndian(header);
-        if (frameLength < 1 || frameLength > MaximumFrameLength) throw Invalid("The elevated scan frame length is invalid.");
+        byte[] header = ArrayPool<byte>.Shared.Rent(FrameHeaderLength);
+        int frameLength;
+        ElevatedScanFrameType type;
+        try
+        {
+            await ReadExactlyAsync(stream, header.AsMemory(0, sizeof(int)), token).ConfigureAwait(false);
+            frameLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+            if (frameLength < 1 || frameLength > MaximumFrameLength) throw Invalid("The elevated scan frame length is invalid.");
+            await ReadExactlyAsync(stream, header.AsMemory(sizeof(int), sizeof(byte)), token).ConfigureAwait(false);
+            type = (ElevatedScanFrameType)header[sizeof(int)];
+        }
+        finally { ArrayPool<byte>.Shared.Return(header); }
 
-        byte[] typeByte = new byte[1];
-        await ReadExactlyAsync(stream, typeByte, token).ConfigureAwait(false);
-        var type = (ElevatedScanFrameType)typeByte[0];
-        byte[] body = new byte[frameLength - 1];
-        if (body.Length > 0) await ReadExactlyAsync(stream, body, token).ConfigureAwait(false);
-        return new(type, body);
+        int bodyLength = frameLength - 1;
+        if (bodyLength == 0) return new(type, Array.Empty<byte>(), 0, pooledBody: false);
+
+        byte[] body = ArrayPool<byte>.Shared.Rent(bodyLength);
+        try
+        {
+            await ReadExactlyAsync(stream, body.AsMemory(0, bodyLength), token).ConfigureAwait(false);
+            return new(type, body, bodyLength, pooledBody: true);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(body);
+            throw;
+        }
     }
 
     internal static void RunSelfTest()
@@ -243,7 +410,8 @@ internal static class ElevatedScanProtocol
         {
             WriteHelloAsync(stream, nonce, CancellationToken.None).GetAwaiter().GetResult();
             stream.Position = 0;
-            byte[] decoded = ReadHello(ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult());
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            byte[] decoded = ReadHello(frame);
             if (!decoded.SequenceEqual(nonce)) throw Invalid("Elevated scan hello round-trip failed.");
         }
 
@@ -255,7 +423,8 @@ internal static class ElevatedScanProtocol
             WriteBatchesAsync(stream, [source], 7, CancellationToken.None).GetAwaiter().GetResult();
             encodedBatch = stream.ToArray();
             stream.Position = 0;
-            (List<FileItem> files, int skipped) = ReadBatch(ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult());
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            (List<FileItem> files, int skipped) = ReadBatch(frame);
             if (skipped != 7 || files.Count != 1 || files[0] != source) throw Invalid("Elevated scan batch round-trip failed.");
         }
 
@@ -264,10 +433,24 @@ internal static class ElevatedScanProtocol
         try
         {
             using var tampered = new MemoryStream(encodedBatch, false);
-            _ = ReadBatch(ReadFrameAsync(tampered, CancellationToken.None).GetAwaiter().GetResult());
+            using ElevatedScanFrame frame = ReadFrameAsync(tampered, CancellationToken.None).GetAwaiter().GetResult();
+            _ = ReadBatch(frame);
         }
         catch (InvalidDataException ex) when (ex.Message.Contains("safety", StringComparison.OrdinalIgnoreCase)) { invalidSafetyRejected = true; }
         if (!invalidSafetyRejected) throw Invalid("Elevated scan accepted an invalid safety value.");
+
+        byte[] invalidUtf8 = (byte[])encodedBatch.Clone();
+        int firstPathByte = FrameHeaderLength + sizeof(int) + sizeof(int) + sizeof(int) + sizeof(int);
+        invalidUtf8[firstPathByte] = 0xFF;
+        bool invalidUtf8Rejected = false;
+        try
+        {
+            using var tampered = new MemoryStream(invalidUtf8, false);
+            using ElevatedScanFrame frame = ReadFrameAsync(tampered, CancellationToken.None).GetAwaiter().GetResult();
+            _ = ReadBatch(frame);
+        }
+        catch (InvalidDataException ex) when (ex.Message.Contains("UTF-8", StringComparison.OrdinalIgnoreCase)) { invalidUtf8Rejected = true; }
+        if (!invalidUtf8Rejected) throw Invalid("Elevated scan accepted an invalid UTF-8 path.");
 
         using (var oversized = new MemoryStream())
         {
@@ -278,9 +461,10 @@ internal static class ElevatedScanProtocol
             bool oversizedRejected = false;
             try
             {
-                _ = ReadFrameAsync(oversized, CancellationToken.None).GetAwaiter().GetResult();
+                using ElevatedScanFrame frame = ReadFrameAsync(oversized, CancellationToken.None).GetAwaiter().GetResult();
             }
             catch (InvalidDataException ex) when (ex.Message.Contains("length", StringComparison.OrdinalIgnoreCase)) { oversizedRejected = true; }
+            catch (EndOfStreamException) { oversizedRejected = false; }
             if (!oversizedRejected) throw Invalid("Elevated scan accepted an oversized frame.");
         }
 
@@ -293,6 +477,52 @@ internal static class ElevatedScanProtocol
         }
         catch (InvalidDataException ex) when (ex.Message.Contains("file record", StringComparison.OrdinalIgnoreCase)) { directoryRejected = true; }
         if (!directoryRejected) throw Invalid("Elevated scan accepted a directory as a file record.");
+
+        using (var stream = new MemoryStream())
+        {
+            WriteReadyAsync(stream, true, CancellationToken.None).GetAwaiter().GetResult();
+            stream.Position = 0;
+            ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            frame.Dispose();
+            bool disposedRejected = false;
+            try { _ = frame.Body.Length; }
+            catch (ObjectDisposedException) { disposedRejected = true; }
+            if (!disposedRejected) throw Invalid("A returned elevated frame remained readable after disposal.");
+        }
+
+        var checkpoint = new NtfsJournalCheckpoint(123, 456, 789);
+        using (var stream = new MemoryStream())
+        {
+            WriteRefreshStartAsync(stream, Path.GetPathRoot(path)!, checkpoint, 123_456, CancellationToken.None).GetAwaiter().GetResult();
+            stream.Position = 0;
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            (string refreshRoot, NtfsJournalCheckpoint decodedCheckpoint, long baselineDriveUsedBytes) = ReadRefreshStart(frame);
+            if (refreshRoot != Path.GetPathRoot(path) || decodedCheckpoint != checkpoint || baselineDriveUsedBytes != 123_456) throw Invalid("Quick-refresh start round-trip failed.");
+        }
+        using (var stream = new MemoryStream())
+        {
+            WriteCompletedAsync(stream, 9, true, CancellationToken.None, checkpoint).GetAwaiter().GetResult();
+            stream.Position = 0;
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            ElevatedScanResult completed = ReadCompleted(frame);
+            if (completed.Skipped != 9 || !completed.BackupPrivilegeEnabled || completed.JournalCheckpoint != checkpoint) throw Invalid("Checkpoint completion round-trip failed.");
+        }
+        using (var stream = new MemoryStream())
+        {
+            var removed = new List<NativeFileId> { new(123, 1), new(123, 2) };
+            WriteRemovedAsync(stream, removed, CancellationToken.None).GetAwaiter().GetResult();
+            stream.Position = 0;
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            if (!ReadRemoved(frame).SequenceEqual(removed)) throw Invalid("Removed-file round-trip failed.");
+        }
+        using (var stream = new MemoryStream())
+        {
+            var completion = new ElevatedRefreshCompletion(checkpoint, 12, 3, 4);
+            WriteRefreshCompletedAsync(stream, completion, CancellationToken.None).GetAwaiter().GetResult();
+            stream.Position = 0;
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            if (ReadRefreshCompleted(frame) != completion) throw Invalid("Quick-refresh completion round-trip failed.");
+        }
     }
 
     internal static void RunPerformanceSelfTest()
@@ -314,7 +544,7 @@ internal static class ElevatedScanProtocol
         int decoded = 0;
         while (stream.Position < stream.Length)
         {
-            ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            using ElevatedScanFrame frame = ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
             (List<FileItem> files, int skipped) = ReadBatch(frame);
             if (skipped != 17 || files.Count == 0) throw Invalid("Elevated protocol performance fixture returned invalid metadata.");
             decoded = checked(decoded + files.Count);
@@ -322,54 +552,89 @@ internal static class ElevatedScanProtocol
         timer.Stop();
         long allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
         if (decoded != count) throw Invalid("Elevated protocol performance fixture lost file records.");
-        if (timer.Elapsed > TimeSpan.FromSeconds(10)) throw Invalid($"Elevated protocol performance regression ({timer.ElapsedMilliseconds} ms). ");
-        if (allocated > 192L * 1024 * 1024) throw Invalid($"Elevated protocol allocation regression ({allocated / (1024 * 1024):N0} MB). ");
+        if (timer.Elapsed > TimeSpan.FromSeconds(8)) throw Invalid($"Elevated protocol performance regression ({timer.ElapsedMilliseconds} ms). ");
+        if (allocated > 112L * 1024 * 1024) throw Invalid($"Elevated protocol allocation regression ({allocated / (1024 * 1024):N0} MB). ");
     }
 
-    private static int GetSerializedRecordLength(FileItem item)
+    private static int BuildBatchBody(
+        byte[] buffer,
+        IReadOnlyList<FileItem> items,
+        ref int itemIndex,
+        int skipped,
+        CancellationToken token)
+    {
+        var writer = new SpanWriter(buffer.AsSpan(0, MaximumFrameBodyLength));
+        writer.WriteInt32(skipped);
+        int countPosition = writer.Position;
+        writer.WriteInt32(0);
+        int frameItems = 0;
+
+        while (itemIndex < items.Count && frameItems < MaximumBatchItems)
+        {
+            token.ThrowIfCancellationRequested();
+            FileItem item = items[itemIndex];
+            SerializedRecord record = MeasureFileItem(item);
+            int nextLength = checked(writer.Position + sizeof(int) + record.Length);
+            if (frameItems > 0 && nextLength > MaximumFrameBodyLength) break;
+            if (nextLength > MaximumFrameBodyLength) throw Invalid("A file record exceeds the elevated scan frame limit.");
+
+            writer.WriteInt32(record.Length);
+            int recordStart = writer.Position;
+            SerializeFileItem(ref writer, item, record);
+            if (writer.Position - recordStart != record.Length) throw Invalid("The elevated scan record length is inconsistent.");
+            frameItems++;
+            itemIndex++;
+        }
+
+        if (frameItems <= 0 || writer.Position > MaximumFrameBodyLength) throw Invalid("The elevated scan batch is invalid.");
+        writer.WriteInt32At(countPosition, frameItems);
+        return writer.Position;
+    }
+
+    private static SerializedRecord MeasureFileItem(FileItem item)
     {
         ValidateFileItem(item);
-        int pathBytes = Utf8.GetByteCount(item.Path);
-        if (pathBytes > MaximumPathBytes) throw Invalid("A scanner file path exceeds its safe protocol limit.");
-        // path length + path + disk/logical/modified + category code + created
-        // + estimate flag + volume + file id + attributes + safety.
-        int length = checked(55 + pathBytes);
+        int pathBytes = GetBoundedUtf8ByteCount(item.Path, MaximumPathBytes);
+        byte category = AnalyzerForm.CategoryCode(item.Category);
+        FileSafety effectiveSafety = AnalyzerForm.EffectiveSafety(item);
+        if (effectiveSafety is not (FileSafety.Normal or FileSafety.Review or FileSafety.Protected))
+            throw Invalid("The scanner produced an invalid file safety value.");
+        int length = checked(FixedRecordBytes + pathBytes);
         if (length <= 0 || length > MaximumRecordLength) throw Invalid("A scanner file record is too large.");
-        return length;
+        return new(length, pathBytes, category, (byte)effectiveSafety);
     }
 
-    private static void SerializeFileItem(BinaryWriter writer, FileItem item)
+    private static void SerializeFileItem(ref SpanWriter writer, FileItem item, SerializedRecord record)
     {
-        ValidateFileItem(item);
-        WriteBoundedString(writer, item.Path, MaximumPathBytes);
-        writer.Write(item.DiskBytes);
-        writer.Write(item.LogicalBytes);
-        writer.Write(item.Modified.ToBinary());
-        writer.Write(AnalyzerForm.CategoryCode(item.Category));
-        writer.Write(item.Created.ToBinary());
-        writer.Write(item.AllocationEstimated);
-        writer.Write(item.VolumeSerial);
-        writer.Write(item.FileIndex);
-        writer.Write((int)item.Attributes);
-        writer.Write((byte)AnalyzerForm.EffectiveSafety(item));
+        writer.WriteUtf8String(item.Path, record.PathBytes);
+        writer.WriteInt64(item.DiskBytes);
+        writer.WriteInt64(item.LogicalBytes);
+        writer.WriteInt64(item.Modified.ToBinary());
+        writer.WriteByte(record.Category);
+        writer.WriteInt64(item.Created.ToBinary());
+        writer.WriteByte(item.AllocationEstimated ? (byte)1 : (byte)0);
+        writer.WriteUInt32(item.VolumeSerial);
+        writer.WriteUInt64(item.FileIndex);
+        writer.WriteInt32((int)item.Attributes);
+        writer.WriteByte(record.Safety);
     }
 
     private static void ValidateFileItem(FileItem item)
     {
-        if (item.DiskBytes < 0 || item.LogicalBytes < 0 || item.Path.Length > 32_767 || !Path.IsPathFullyQualified(item.Path) || item.Category.Length > 256 || (item.Attributes & FileAttributes.Directory) != 0)
+        bool identityComplete = (item.VolumeSerial == 0) == (item.FileIndex == 0);
+        if (item.DiskBytes < 0 || item.LogicalBytes < 0 || item.Path.Length > 32_767 || !Path.IsPathFullyQualified(item.Path) || item.Category.Length > 256 || !identityComplete || (item.Attributes & FileAttributes.Directory) != 0)
             throw Invalid("The scanner produced an invalid file record.");
-        _ = AnalyzerForm.CategoryCode(item.Category);
     }
 
-    private static FileItem DeserializeFileItem(MemoryStream body)
+    private static FileItem DeserializeFileItem(ReadOnlySpan<byte> body)
     {
-        using var reader = new BinaryReader(body, Utf8, true);
-        string path = ReadBoundedString(reader, MaximumPathBytes);
+        var reader = new SpanReader(body);
+        string path = reader.ReadUtf8String(MaximumPathBytes);
         long diskBytes = reader.ReadInt64();
         long logicalBytes = reader.ReadInt64();
-        DateTime modified = DateTime.FromBinary(reader.ReadInt64());
+        DateTime modified = ReadDateTime(ref reader);
         string category = AnalyzerForm.CategoryFromCode(reader.ReadByte());
-        DateTime created = DateTime.FromBinary(reader.ReadInt64());
+        DateTime created = ReadDateTime(ref reader);
         byte estimatedValue = reader.ReadByte();
         if (estimatedValue > 1) throw Invalid("The helper returned an invalid allocation-estimate flag.");
         bool estimated = estimatedValue == 1;
@@ -377,30 +642,48 @@ internal static class ElevatedScanProtocol
         ulong fileIndex = reader.ReadUInt64();
         FileAttributes attributes = (FileAttributes)reader.ReadInt32();
         FileSafety safety = (FileSafety)reader.ReadByte();
-        EnsureConsumed(body);
+        reader.EnsureConsumed();
 
         if (path.Length == 0 || path.Length > 32_767 || !Path.IsPathFullyQualified(path) || category.Length > 256 || diskBytes < 0 || logicalBytes < 0 || (attributes & FileAttributes.Directory) != 0)
             throw Invalid("The helper returned an invalid file record.");
-        if (volumeSerial != 0 && fileIndex == 0) throw Invalid("The helper returned an incomplete file identity.");
+        if ((volumeSerial == 0) != (fileIndex == 0)) throw Invalid("The helper returned an incomplete file identity.");
         if (safety is not (FileSafety.Normal or FileSafety.Review or FileSafety.Protected)) throw Invalid("The helper returned an invalid file safety value.");
-        return new(Path.GetFullPath(path), diskBytes, logicalBytes, modified, category, created, estimated, volumeSerial, fileIndex, attributes, safety);
+
+        string canonicalPath;
+        try { canonicalPath = Path.GetFullPath(path); }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            throw new InvalidDataException("The helper returned a file path that could not be canonicalized.", ex);
+        }
+        return new(canonicalPath, diskBytes, logicalBytes, modified, category, created, estimated, volumeSerial, fileIndex, attributes, safety);
+    }
+
+    private static DateTime ReadDateTime(ref SpanReader reader)
+    {
+        try { return DateTime.FromBinary(reader.ReadInt64()); }
+        catch (ArgumentException ex) { throw new InvalidDataException("The helper returned an invalid file timestamp.", ex); }
     }
 
     private static async Task WriteFrameAsync(
         Stream stream,
         ElevatedScanFrameType type,
         ReadOnlyMemory<byte> body,
-        CancellationToken token)
+        CancellationToken token,
+        bool flush = true)
     {
         int frameLength = checked(1 + body.Length);
         if (frameLength > MaximumFrameLength) throw Invalid("The elevated scan frame exceeds the protocol limit.");
 
-        byte[] header = new byte[sizeof(int) + 1];
-        BinaryPrimitives.WriteInt32LittleEndian(header, frameLength);
-        header[sizeof(int)] = (byte)type;
-        await stream.WriteAsync(header, token).ConfigureAwait(false);
-        if (!body.IsEmpty) await stream.WriteAsync(body, token).ConfigureAwait(false);
-        await stream.FlushAsync(token).ConfigureAwait(false);
+        byte[] header = ArrayPool<byte>.Shared.Rent(FrameHeaderLength);
+        try
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(header, frameLength);
+            header[sizeof(int)] = (byte)type;
+            await stream.WriteAsync(header.AsMemory(0, FrameHeaderLength), token).ConfigureAwait(false);
+            if (!body.IsEmpty) await stream.WriteAsync(body, token).ConfigureAwait(false);
+            if (flush) await stream.FlushAsync(token).ConfigureAwait(false);
+        }
+        finally { ArrayPool<byte>.Shared.Return(header); }
     }
 
     private static async Task ReadExactlyAsync(Stream stream, Memory<byte> destination, CancellationToken token)
@@ -414,36 +697,13 @@ internal static class ElevatedScanProtocol
         }
     }
 
-    private static void WriteBoundedString(BinaryWriter writer, string value, int maximumBytes)
+    private static int GetBoundedUtf8ByteCount(string value, int maximumBytes)
     {
-        int length = Utf8.GetByteCount(value);
+        int length;
+        try { length = Utf8.GetByteCount(value); }
+        catch (EncoderFallbackException ex) { throw new InvalidDataException("A protocol string is not valid UTF-16.", ex); }
         if (length > maximumBytes) throw Invalid("A protocol string exceeds its allowed length.");
-        writer.Write(length);
-        if (length <= 1024)
-        {
-            Span<byte> bytes = stackalloc byte[length];
-            Utf8.GetBytes(value.AsSpan(), bytes);
-            writer.Write(bytes);
-            return;
-        }
-
-        byte[] rented = ArrayPool<byte>.Shared.Rent(length);
-        try
-        {
-            int written = Utf8.GetBytes(value.AsSpan(), rented.AsSpan(0, length));
-            writer.Write(rented, 0, written);
-        }
-        finally { ArrayPool<byte>.Shared.Return(rented); }
-    }
-
-    private static string ReadBoundedString(BinaryReader reader, int maximumBytes)
-    {
-        int length = reader.ReadInt32();
-        if (length < 0 || length > maximumBytes || length > reader.BaseStream.Length - reader.BaseStream.Position)
-            throw Invalid("A protocol string has an invalid length.");
-        byte[] bytes = reader.ReadBytes(length);
-        if (bytes.Length != length) throw new EndOfStreamException("A protocol string ended unexpectedly.");
-        return Utf8.GetString(bytes);
+        return length;
     }
 
     private static void RequireType(ElevatedScanFrame frame, ElevatedScanFrameType expected)
@@ -451,10 +711,90 @@ internal static class ElevatedScanProtocol
         if (frame.Type != expected) throw Invalid($"Expected {expected} but received {frame.Type}.");
     }
 
-    private static void EnsureConsumed(MemoryStream stream)
+    private static InvalidDataException Invalid(string message) => new(message);
+
+    private readonly record struct SerializedRecord(int Length, int PathBytes, byte Category, byte Safety);
+
+    private ref struct SpanReader
     {
-        if (stream.Position != stream.Length) throw Invalid("The elevated scan frame has trailing data.");
+        private readonly ReadOnlySpan<byte> source;
+        private int position;
+
+        internal SpanReader(ReadOnlySpan<byte> source)
+        {
+            this.source = source;
+            position = 0;
+        }
+
+        internal int Remaining => source.Length - position;
+
+        internal byte ReadByte() => ReadBytes(sizeof(byte))[0];
+        internal int ReadInt32() => BinaryPrimitives.ReadInt32LittleEndian(ReadBytes(sizeof(int)));
+        internal uint ReadUInt32() => BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(sizeof(uint)));
+        internal long ReadInt64() => BinaryPrimitives.ReadInt64LittleEndian(ReadBytes(sizeof(long)));
+        internal ulong ReadUInt64() => BinaryPrimitives.ReadUInt64LittleEndian(ReadBytes(sizeof(ulong)));
+
+        internal ReadOnlySpan<byte> ReadBytes(int count)
+        {
+            if (count < 0 || count > Remaining) throw Invalid("The elevated scan frame ended unexpectedly.");
+            ReadOnlySpan<byte> value = source.Slice(position, count);
+            position += count;
+            return value;
+        }
+
+        internal string ReadUtf8String(int maximumBytes)
+        {
+            int length = ReadInt32();
+            if (length < 0 || length > maximumBytes || length > Remaining) throw Invalid("A protocol string has an invalid length.");
+            try { return Utf8.GetString(ReadBytes(length)); }
+            catch (DecoderFallbackException ex) { throw new InvalidDataException("A protocol string contains invalid UTF-8.", ex); }
+        }
+
+        internal void EnsureConsumed()
+        {
+            if (Remaining != 0) throw Invalid("The elevated scan frame has trailing data.");
+        }
     }
 
-    private static InvalidDataException Invalid(string message) => new(message);
+    private ref struct SpanWriter
+    {
+        private readonly Span<byte> destination;
+        private int position;
+
+        internal SpanWriter(Span<byte> destination)
+        {
+            this.destination = destination;
+            position = 0;
+        }
+
+        internal int Position => position;
+
+        internal void WriteByte(byte value) => Reserve(sizeof(byte))[0] = value;
+        internal void WriteInt32(int value) => BinaryPrimitives.WriteInt32LittleEndian(Reserve(sizeof(int)), value);
+        internal void WriteUInt32(uint value) => BinaryPrimitives.WriteUInt32LittleEndian(Reserve(sizeof(uint)), value);
+        internal void WriteInt64(long value) => BinaryPrimitives.WriteInt64LittleEndian(Reserve(sizeof(long)), value);
+        internal void WriteUInt64(ulong value) => BinaryPrimitives.WriteUInt64LittleEndian(Reserve(sizeof(ulong)), value);
+
+        internal void WriteInt32At(int offset, int value)
+        {
+            if (offset < 0 || offset > destination.Length - sizeof(int)) throw Invalid("The elevated scan frame writer used an invalid offset.");
+            BinaryPrimitives.WriteInt32LittleEndian(destination.Slice(offset, sizeof(int)), value);
+        }
+
+        internal void WriteUtf8String(string value, int encodedLength)
+        {
+            WriteInt32(encodedLength);
+            Span<byte> bytes = Reserve(encodedLength);
+            int written = Utf8.GetBytes(value.AsSpan(), bytes);
+            if (written != encodedLength) throw Invalid("A protocol string changed while it was being encoded.");
+        }
+
+        private Span<byte> Reserve(int count)
+        {
+            if (count < 0 || count > destination.Length - position) throw Invalid("The elevated scan frame exceeded its bounded buffer.");
+            Span<byte> value = destination.Slice(position, count);
+            position += count;
+            return value;
+        }
+    }
 }
