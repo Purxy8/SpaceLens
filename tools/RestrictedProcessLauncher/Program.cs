@@ -15,11 +15,14 @@ internal static class RestrictedProcessLauncher
     private const uint TokenAssignPrimary = 0x0001;
     private const uint DisableMaxPrivilege = 0x0001;
     private const uint LuaToken = 0x0004;
+    private const int TokenPrivileges = 3;
     private const int TokenElevationType = 18;
     private const int TokenElevation = 20;
-    private const int TokenHasRestrictions = 21;
     private const int TokenElevationTypeDefault = 1;
     private const int TokenElevationTypeLimited = 3;
+    private const uint SePrivilegeEnabled = 0x00000002;
+    private const int ErrorInsufficientBuffer = 122;
+    private const int MaximumTokenPrivilegesBytes = 64 * 1024;
     private const int SecurityImpersonation = 2;
     private const int TokenTypeImpersonation = 2;
     private const uint CreateSuspended = 0x00000004;
@@ -220,9 +223,47 @@ internal static class RestrictedProcessLauncher
         int elevationType = GetTokenInt32(token, TokenElevationType, "TokenElevationType");
         if (elevationType is not TokenElevationTypeDefault and not TokenElevationTypeLimited)
             throw new SecurityException($"The {description} reports an unsafe or unknown elevation type ({elevationType}).");
-        if (GetTokenInt32(token, TokenHasRestrictions, "TokenHasRestrictions") == 0)
-            throw new SecurityException($"The {description} does not report token restrictions.");
+        VerifyNoPowerfulEnabledPrivileges(token, description);
         if (IsAdministrator(token)) throw new SecurityException($"The {description} still has enabled Administrators membership.");
+    }
+
+    private static void VerifyNoPowerfulEnabledPrivileges(SafeAccessTokenHandle token, string description)
+    {
+        if (GetTokenInformationBuffer(token, TokenPrivileges, IntPtr.Zero, 0, out int requiredBytes))
+            throw new SecurityException($"The {description} privilege query unexpectedly succeeded without a buffer.");
+        int queryError = Marshal.GetLastPInvokeError();
+        if (queryError != ErrorInsufficientBuffer)
+            throw Win32(queryError, "GetTokenInformation(TokenPrivileges size)");
+        if (requiredBytes < sizeof(uint) || requiredBytes > MaximumTokenPrivilegesBytes)
+            throw new SecurityException($"The {description} privilege information size is invalid ({requiredBytes}).");
+
+        IntPtr buffer = Marshal.AllocHGlobal(requiredBytes);
+        try
+        {
+            if (!GetTokenInformationBuffer(token, TokenPrivileges, buffer, requiredBytes, out int returnedBytes))
+                throw Win32("GetTokenInformation(TokenPrivileges)");
+            if (returnedBytes < sizeof(uint) || returnedBytes > requiredBytes)
+                throw new SecurityException($"The {description} privilege information length is invalid ({returnedBytes}).");
+
+            uint count = unchecked((uint)Marshal.ReadInt32(buffer));
+            int entrySize = Marshal.SizeOf<LuidAndAttributes>();
+            if (entrySize != 12)
+                throw new SecurityException($"The native LUID_AND_ATTRIBUTES layout is unexpected ({entrySize}).");
+            int maximumCount = (returnedBytes - sizeof(uint)) / entrySize;
+            if (count > maximumCount)
+                throw new SecurityException($"The {description} privilege count exceeds its bounded buffer.");
+            if (!LookupPrivilegeValue(null, "SeChangeNotifyPrivilege", out Luid changeNotify))
+                throw Win32("LookupPrivilegeValue(SeChangeNotifyPrivilege)");
+
+            for (uint index = 0; index < count; index++)
+            {
+                int offset = checked(sizeof(uint) + checked((int)index * entrySize));
+                var privilege = Marshal.PtrToStructure<LuidAndAttributes>(IntPtr.Add(buffer, offset));
+                if ((privilege.Attributes & SePrivilegeEnabled) != 0 && !privilege.Luid.Equals(changeNotify))
+                    throw new SecurityException($"The {description} retains an enabled powerful privilege.");
+            }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
     }
 
     private static int GetTokenElevation(SafeAccessTokenHandle token)
@@ -254,7 +295,10 @@ internal static class RestrictedProcessLauncher
         }
     }
 
-    private static Win32Exception Win32(string operation) => new(Marshal.GetLastPInvokeError(), operation);
+    private static Win32Exception Win32(string operation) => Win32(Marshal.GetLastPInvokeError(), operation);
+
+    private static Win32Exception Win32(int error, string operation) =>
+        new(error, $"{operation} failed with Win32 error {error}: {new Win32Exception(error).Message}");
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo
@@ -314,6 +358,22 @@ internal static class RestrictedProcessLauncher
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private readonly struct Luid : IEquatable<Luid>
+    {
+        internal readonly uint LowPart;
+        internal readonly int HighPart;
+
+        public bool Equals(Luid other) => LowPart == other.LowPart && HighPart == other.HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct LuidAndAttributes
+    {
+        internal readonly Luid Luid;
+        internal readonly uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct JobObjectExtendedLimitInformation
     {
         internal JobObjectBasicLimitInformation BasicLimitInformation;
@@ -347,6 +407,14 @@ internal static class RestrictedProcessLauncher
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetTokenInformation(SafeAccessTokenHandle token, int informationClass, out int information, int informationLength, out int returnLength);
+
+    [DllImport("advapi32.dll", EntryPoint = "GetTokenInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformationBuffer(SafeAccessTokenHandle token, int informationClass, IntPtr information, int informationLength, out int returnLength);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValue(string? systemName, string name, out Luid luid);
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
