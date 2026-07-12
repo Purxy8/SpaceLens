@@ -330,6 +330,54 @@ try {
         if ($rotationScript -notmatch [regex]::Escape($targetControl)) { throw "Trust-rotation handoff lacks target ancestry/set validation $targetControl." }
     }
 
+    $launcherProject = Get-Content -Raw -LiteralPath (Join-Path $repository 'tools\RestrictedProcessLauncher\RestrictedProcessLauncher.csproj')
+    if ($launcherProject -notmatch '<SelfContained>false</SelfContained>' -or
+        $launcherProject -notmatch 'System\.StartupHookProvider\.IsSupported" Value="false"') {
+        throw 'The CI-only restricted launcher must remain framework-dependent and immune to inherited startup hooks.'
+    }
+    $launcherSource = Get-Content -Raw -LiteralPath (Join-Path $repository 'tools\RestrictedProcessLauncher\Program.cs')
+    foreach ($launcherControl in @(
+        'CreateRestrictedToken', 'DisableMaxPrivilege | LuaToken', 'TokenAssignPrimary | TokenDuplicate | TokenQuery', 'CreateSuspended',
+        'OpenProcessToken(process.Process, TokenDuplicate | TokenQuery', 'GetTokenElevation', 'TokenElevationTypeLimited', 'TokenHasRestrictions',
+        'DuplicateTokenEx', 'CheckTokenMembership(impersonationToken',
+        'AssignProcessToJobObject', 'JobObjectLimitKillOnJobClose', 'TerminateJobObject', 'ResumeThread',
+        'BuildSanitizedEnvironmentBlock', 'COREHOST_', 'APP_CONTEXT_', 'NATIVE_DLL_SEARCH_DIRECTORIES',
+        'DOTNET_STARTUP_HOOKS', 'SPACELENS_STARTUP_HOOK_MARKER',
+        'SpaceLens.exe', 'SpaceLens-Setup.exe', 'args[1], "--self-test"'
+    )) {
+        if ($launcherSource -notmatch [regex]::Escape($launcherControl)) { throw "Restricted launcher is missing security control: $launcherControl" }
+    }
+    $childTokenCheck = $launcherSource.IndexOf('VerifyRestrictedNonAdministrator(childToken', [StringComparison]::Ordinal)
+    $childResume = $launcherSource.IndexOf('ResumeThread(process.Thread)', [StringComparison]::Ordinal)
+    if ($childTokenCheck -lt 0 -or $childResume -le $childTokenCheck) { throw 'The suspended child token must be verified before its first instruction is resumed.' }
+    if ($launcherSource -notmatch '(?s)commandLine,\s*IntPtr\.Zero,\s*IntPtr\.Zero,\s*false,\s*CreateSuspended \| CreateUnicodeEnvironment \| CreateNoWindow,\s*environment,') {
+        throw 'The sanitized environment block must be passed as lpEnvironment, never as process/thread security attributes.'
+    }
+    if ($launcherSource -match '(?im)Process\.Start|UseShellExecute|cmd\.exe|powershell') { throw 'Restricted launcher must never invoke a shell or managed process launcher.' }
+    $launcherNativeSecurity = Get-Content -Raw -LiteralPath (Join-Path $repository 'tools\RestrictedProcessLauncher\NativeSecurity.cs')
+    if ($launcherNativeSecurity -notmatch 'DefaultDllImportSearchPaths\(DllImportSearchPath\.System32\)') { throw 'Restricted launcher must resolve its native APIs only from System32.' }
+
+    $releaseBuild = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'Build-Release.ps1')
+    foreach ($buildControl in @('Test-CurrentProcessAdministrator', 'restrictedTestLauncher', 'RestrictedProcessLauncher.csproj', 'The restricted CI launcher accepts only the exact packaged --self-test command')) {
+        if ($releaseBuild -notmatch [regex]::Escape($buildControl)) { throw "Build-Release lacks restricted elevated-host test control: $buildControl" }
+    }
+    $startupHookTest = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1')
+    if ($startupHookTest -notmatch '\[string\]\$RestrictedLauncher' -or $startupHookTest -notmatch 'Start-Process -FilePath \(\[IO\.Path\]::GetFullPath\(\$RestrictedLauncher\)\)') {
+        throw 'Startup-hook isolation must support the same restricted packaged-test launcher on elevated hosts.'
+    }
+    foreach ($productionSource in Get-ChildItem -LiteralPath (Join-Path $repository 'src') -Filter '*.cs' -File -Recurse) {
+        if ((Get-Content -Raw -LiteralPath $productionSource.FullName) -match 'RestrictedProcessLauncher') {
+            throw "Production source must not reference the CI-only restricted launcher: $($productionSource.FullName)"
+        }
+    }
+
+    $builtLauncher = Join-Path $repository 'artifacts\intermediate\restricted-process-launcher\RestrictedProcessLauncher.exe'
+    if (Test-Path -LiteralPath $builtLauncher -PathType Leaf) {
+        $negative = Start-Process -FilePath $builtLauncher -PassThru -Wait -WindowStyle Hidden
+        try { $negativeExit = $negative.ExitCode } finally { $negative.Dispose() }
+        if ($negativeExit -ne 125) { throw "Restricted launcher did not fail closed for an invalid invocation: $negativeExit" }
+    }
+
     $appProgram = Get-Content -Raw -LiteralPath (Join-Path $repository 'src\SpaceLens\Program.cs')
     $appElevationGate = $appProgram.IndexOf('TryGetCurrentProcessElevation', [StringComparison]::Ordinal)
     foreach ($sensitiveEntry in @('CrashLog.Initialize()', 'args.Contains("--self-test")', '"--integration-test-elevated-scan"', '"--verify-update-manifest"', '"--uninstall-helper"')) {

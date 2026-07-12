@@ -16,10 +16,11 @@ $versionProperties = Join-Path $repository 'Directory.Build.props'
 $appProject = Join-Path $repository 'src\SpaceLens\SpaceLens.csproj'
 $setupProject = Join-Path $repository 'src\SpaceLens.Setup\SpaceLens.Setup.csproj'
 $signerProject = Join-Path $repository 'tools\ReleaseSigner\ReleaseSigner.csproj'
+$restrictedLauncherProject = Join-Path $repository 'tools\RestrictedProcessLauncher\RestrictedProcessLauncher.csproj'
 $publicKey = Join-Path $repository 'src\SpaceLens\assets\update-public-key.pem'
 $releaseSecurityModule = Join-Path $PSScriptRoot 'ReleaseSecurity.psm1'
 
-foreach ($required in @($versionProperties, $appProject, $setupProject, $signerProject, $publicKey, $releaseSecurityModule)) {
+foreach ($required in @($versionProperties, $appProject, $setupProject, $signerProject, $restrictedLauncherProject, $publicKey, $releaseSecurityModule)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required file is missing: $required"
     }
@@ -112,6 +113,25 @@ function Invoke-DotNet {
     }
 }
 
+function Test-CurrentProcessAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try { return [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+        finally { $identity.Dispose() }
+    }
+    catch { throw "Could not determine build-host elevation safely: $($_.Exception.Message)" }
+}
+
+$script:restrictedTestLauncher = ''
+
+function Test-ManagedInjectionEnvironmentName {
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($prefix in @('COR_', 'CORECLR_', 'COMPlus_', 'DOTNET_', 'SPACELENS_')) {
+        if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Invoke-PackagedExecutable {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -120,13 +140,40 @@ function Invoke-PackagedExecutable {
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 60
     )
 
-    foreach ($argument in $Arguments) {
+    $launchPath = $Path
+    $launchArguments = $Arguments
+    if ($script:restrictedTestLauncher) {
+        if ($Arguments.Count -ne 1 -or -not [string]::Equals($Arguments[0], '--self-test', [StringComparison]::Ordinal)) {
+            throw 'The restricted CI launcher accepts only the exact packaged --self-test command.'
+        }
+        $launchPath = $script:restrictedTestLauncher
+        $launchArguments = @([IO.Path]::GetFullPath($Path), '--self-test')
+    }
+
+    foreach ($argument in $launchArguments) {
         if ($argument.Contains('"')) {
             throw "$Description contains an unsupported quote in an argument."
         }
     }
-    $argumentLine = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $process = Start-Process -FilePath $Path -ArgumentList $argumentLine -PassThru -WindowStyle Hidden
+    $argumentLine = ($launchArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $savedInjectionEnvironment = @{}
+    try {
+        if ($script:restrictedTestLauncher) {
+            foreach ($entry in [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process).GetEnumerator()) {
+                $name = [string]$entry.Key
+                if (Test-ManagedInjectionEnvironmentName -Name $name) {
+                    $savedInjectionEnvironment[$name] = [string]$entry.Value
+                    [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)
+                }
+            }
+        }
+        $process = Start-Process -FilePath $launchPath -ArgumentList $argumentLine -PassThru -WindowStyle Hidden
+    }
+    finally {
+        foreach ($entry in $savedInjectionEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable([string]$entry.Key, [string]$entry.Value, [EnvironmentVariableTarget]::Process)
+        }
+    }
     try {
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -184,6 +231,31 @@ if ($NuGetConfig) {
     }
     $appRestoreArguments += @('--configfile', $resolvedNuGetConfig)
 }
+
+if (Test-CurrentProcessAdministrator) {
+    $restrictedLauncherPublish = Join-Path $intermediate 'restricted-process-launcher'
+    New-Item -ItemType Directory -Force -Path $restrictedLauncherPublish | Out-Null
+    $launcherRestoreArguments = @('restore', $restrictedLauncherProject, '-r', 'win-x64', '--nologo')
+    if ($resolvedNuGetConfig) { $launcherRestoreArguments += @('--configfile', $resolvedNuGetConfig) }
+    Invoke-DotNet -Arguments $launcherRestoreArguments
+    Invoke-DotNet -Arguments @(
+        'publish', $restrictedLauncherProject,
+        '-c', 'Release',
+        '-r', 'win-x64',
+        '--self-contained', 'false',
+        '-p:DebugType=None',
+        '-p:DebugSymbols=false',
+        '-o', $restrictedLauncherPublish,
+        '--no-restore',
+        '--nologo'
+    )
+    $script:restrictedTestLauncher = Join-Path $restrictedLauncherPublish 'RestrictedProcessLauncher.exe'
+    $launcherItem = Get-Item -LiteralPath $script:restrictedTestLauncher -Force
+    if ($launcherItem.PSIsContainer -or ($launcherItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $launcherItem.Length -le 0) {
+        throw 'The restricted packaged-self-test launcher is missing or unsafe.'
+    }
+    Write-Host 'Elevated build host detected; packaged self-tests will run under a verified restricted LUA token.'
+}
 Invoke-DotNet -Arguments $appRestoreArguments
 
 Invoke-DotNet -Arguments @(
@@ -207,7 +279,11 @@ $app = Join-Path $package 'SpaceLens.exe'
 Copy-Item -LiteralPath $publishedApp -Destination $app
 Write-HashFile -Path $app
 Invoke-PackagedExecutable -Path $app -Arguments @('--self-test') -Description 'SpaceLens packaged self-test' -TimeoutSeconds 180
-& (Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1') -Executable $app -WorkDirectory $intermediate
+$startupHookTest = Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1'
+if ($script:restrictedTestLauncher) {
+    & $startupHookTest -Executable $app -WorkDirectory $intermediate -RestrictedLauncher $script:restrictedTestLauncher
+}
+else { & $startupHookTest -Executable $app -WorkDirectory $intermediate }
 
 $payloadProperty = "-p:SpaceLensPayload=$app"
 $setupRestoreArguments = @('restore', $setupProject, '-r', 'win-x64', $payloadProperty, '--nologo')
