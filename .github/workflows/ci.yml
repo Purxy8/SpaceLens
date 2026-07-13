@@ -12,13 +12,43 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install .NET 10 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5.2.0
         with:
           dotnet-version: 10.0.301
 
       - name: Build packages and run packaged self-tests
         shell: pwsh
         run: .\scripts\Build-Release.ps1
+
+      - name: Run release supply-chain negative tests
+        shell: pwsh
+        run: .\scripts\Test-ReleaseSecurity.ps1
+
+      - name: Upload exact NativeAOT release signer
+        if: ${{ github.event_name == 'push' && github.repository == 'Purxy8/SpaceLens' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SpaceLens-ReleaseSigner-${{ github.sha }}
+          path: artifacts/intermediate/native-release-signer/ReleaseSigner.exe
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Upload release signer SHA-256 separately
+        if: ${{ github.event_name == 'push' && github.repository == 'Purxy8/SpaceLens' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SpaceLens-ReleaseSigner-SHA256-${{ github.sha }}
+          path: artifacts/intermediate/ReleaseSigner.exe.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false

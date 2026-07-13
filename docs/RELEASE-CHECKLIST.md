@@ -1,33 +1,30 @@
 # Release checklist
 
 - [ ] Version is strict `MAJOR.MINOR.PATCH` everywhere.
-- [ ] SignPath onboarding is complete and the approved project, policy, and artifact configurations match this repository.
-- [ ] SignPath signing runs from a fresh `vVERSION` tag, treated as immutable, for this exact source commit.
+- [ ] SignPath is marked not applicable for 1.6.1: the safety-locked placeholder remains inert, has no secrets/actions, and was not enabled for this release.
 - [ ] No previously published or signed tag was moved or reused.
 - [ ] Release notes and changelog are updated.
 - [ ] Application and Setup publish successfully with zero build errors.
 - [ ] Application packaged self-test passes.
 - [ ] Setup packaged self-test passes.
-- [ ] Diagnostics single-file probe passes a real medium-integrity-to-UAC Full access scan: exactly one Ready=true event, at least one file batch, and backup privilege enabled.
-- [ ] Full access smoke test is repeated from installed and portable locations; canceling UAC preserves prior results.
+- [ ] For 1.6.1, the historical Full access/UAC integration probe is marked not applicable while the production feature gate is false.
+- [ ] Every retired helper command-line/IPC entry point rejects activation; standard installed and portable scans remain unelevated.
+- [ ] Published SpaceLens passes the harmless `DOTNET_STARTUP_HOOKS` rejection probe and no marker is created.
 - [ ] Recycle Bin integration test passes for multiple disposable files.
 - [ ] Normal/minimized startup smoke test passes.
 - [ ] Setup embeds the exact intended application payload.
-- [ ] For a SignPath release, the application was signed first, its Authenticode signature and metadata were verified, and Setup embeds that exact signed application.
-- [ ] For a SignPath release, final Setup was separately signed and both signatures report a trusted, timestamped publisher before hashes were generated.
-- [ ] Before enabling the SignPath workflow, its literal safety lock was removed only after every `uses:` reference was pinned to an audited full commit SHA.
-- [ ] The downloaded SignPath ZIP matches the artifact SHA-256 copied separately from the trusted workflow summary, and the supplied workflow run ID is exact.
-- [ ] The supplied workflow run ID belongs to the expected successful tag run.
-- [ ] The downloaded SignPath ZIP is unmodified and remains outside the repository.
-- [ ] Finalization runs from a clean checkout of the exact source commit in `release-metadata.json`.
-- [ ] The downloaded SignPath `release-metadata.json` identifies `Purxy8/SpaceLens`, the expected tag/ref, source commit, workflow run ID/URL, both signing requests, exact hashes and sizes, and signer thumbprints.
+- [ ] Offline finalization runs from a clean checkout of the exact prepared source commit and uses the independently supplied prepared-ZIP and NativeAOT-signer SHA-256 values.
+- [ ] The prepared ZIP is a regular non-empty file, and one no-write/no-delete handle remains open continuously from digest verification through bounded extraction.
+- [ ] Native `ReleaseSigner.exe` is the only file in its directory, remains locked throughout use, and passes its self-test before private-key access.
 - [ ] Final executable hashes match their `.sha256` files.
 - [ ] `update.json` contains Setup's exact final size and SHA-256.
 - [ ] `update.json` verifies with the tracked public key.
+- [ ] The v1.6.1 CNG rotation was run by the maintainer's normal interactive Windows account, never an agent/runner/CI/service identity; only the new public key and fresh signed 9.9.9 fixture changed.
+- [ ] Users on 1.6.0 or earlier are directed to a manual official-release bootstrap; the old key is not used to authenticate the trust transition.
 - [ ] No private key, secret, local path, log, cache, or generated binary is staged in Git.
 - [ ] Production package was built with `SpaceLensEnableDiagnostics=false`; diagnostic command switches are unavailable.
 - [ ] The offline ECDSA update key was never uploaded to GitHub Actions or SignPath.
-- [ ] Draft GitHub release contains all six required assets.
+- [ ] Draft GitHub release contains all seven required assets, including `release-provenance.json`.
 - [ ] Release notes link the public code signing policy and accurately state whether this release is Authenticode-signed.
 - [ ] README, SECURITY, and release notes accurately distinguish older unsigned releases from the first Authenticode-signed release.
 - [ ] Latest-download links work before announcing the release.

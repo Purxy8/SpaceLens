@@ -2,17 +2,46 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text.Json;
 using Microsoft.Win32;
 
 namespace SpaceLensSetup;
+
+internal static class SetupProcessSecurity
+{
+    internal const string ElevatedInstallMessage = "SpaceLens Setup is running with Administrator rights. Close it and run Setup normally. SpaceLens installs only for this Windows account, and Administrator access is not required.";
+
+    internal static bool IsElevated
+    {
+        get
+        {
+            try
+            {
+                using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+                return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch { return true; }
+        }
+    }
+
+    internal static bool ShouldRefuseInstall(bool elevated) => elevated;
+}
 
 internal static class Program
 {
     [STAThread]
     private static void Main(string[] args)
     {
+        if (SetupProcessSecurity.IsElevated)
+        {
+            ApplicationConfiguration.Initialize();
+            MessageBox.Show(SetupProcessSecurity.ElevatedInstallMessage, "Run Setup normally", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Environment.ExitCode = 5;
+            return;
+        }
         if (args.Contains("--self-test")) { ApplicationConfiguration.Initialize(); Environment.ExitCode = SetupEngine.SelfTest() ? 0 : 1; return; }
         int waitIndex = Array.IndexOf(args, "--wait-pid"); if (waitIndex >= 0 && waitIndex + 1 < args.Length && int.TryParse(args[waitIndex + 1], out int processId)) try { Process.GetProcessById(processId).WaitForExit(20000); } catch { }
         bool upgrade = args.Contains("--upgrade") || File.Exists(SetupEngine.InstalledExecutable); ApplicationConfiguration.Initialize(); Application.Run(new SetupForm(upgrade)); if (upgrade && Environment.ProcessPath is string self) SetupEngine.ScheduleSelfDelete(self);
@@ -61,7 +90,14 @@ internal sealed class SetupForm : Form
         {
             await Task.Run(() => SetupEngine.Install(createDesktopShortcut, enableAutomaticUpdates)); state.Text = "Installation complete.";
             completed = true;
-            if (launchAfter.Checked) try { Process.Start(new ProcessStartInfo(SetupEngine.InstalledExecutable) { UseShellExecute = true }); } catch (Exception ex) { MessageBox.Show(this, $"SpaceLens was installed, but Windows could not launch it.\n\n{ex.Message}", "Installed successfully", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            if (launchAfter.Checked) try
+            {
+                if (SetupProcessSecurity.IsElevated) throw new SecurityException(SetupProcessSecurity.ElevatedInstallMessage);
+                using FileStream launchLock = SetupEngine.OpenVerifiedPayloadForLaunch(SetupEngine.InstalledExecutable);
+                using Process? process = Process.Start(new ProcessStartInfo(SetupEngine.InstalledExecutable) { UseShellExecute = false, WorkingDirectory = SetupEngine.InstallDirectory });
+                if (process is null) throw new InvalidOperationException("Windows could not start SpaceLens.");
+            }
+            catch (Exception ex) { MessageBox.Show(this, $"SpaceLens was installed, but Windows could not launch it.\n\n{ex.Message}", "Installed successfully", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
         catch (Exception ex) { state.Text = "Installation failed."; MessageBox.Show(this, ex.Message, "Could not install SpaceLens", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         finally
@@ -91,12 +127,16 @@ internal static class SetupEngine
 
     internal static void Install(bool createDesktopShortcut, bool enableAutomaticUpdates)
     {
+        if (SetupProcessSecurity.IsElevated) throw new SecurityException(SetupProcessSecurity.ElevatedInstallMessage);
         using var installMutex = new Mutex(false, InstallMutexName); bool ownsMutex;
         try { ownsMutex = installMutex.WaitOne(0); } catch (AbandonedMutexException) { ownsMutex = true; }
         if (!ownsMutex) throw new InvalidOperationException("Another SpaceLens installation is already running. Finish or close it, then try again.");
         try
         {
-            Directory.CreateDirectory(InstallDirectory); RecoverInterruptedInstall(); EnsureNotRunning();
+            ValidateInstallDirectoryChain();
+            Directory.CreateDirectory(InstallDirectory);
+            ValidateInstallDirectoryChain();
+            RecoverInterruptedInstall(); EnsureNotRunning();
             string staging = InstalledExecutable + ".installing", backup = InstalledExecutable + ".backup"; bool replaced = false;
             var desktopState = FileState.Capture(DesktopShortcut); var startMenuState = FileState.Capture(StartMenuShortcut); var updateState = FileState.Capture(UpdateStatePath); var registryState = UninstallRegistryState.Capture();
             try
@@ -104,7 +144,10 @@ internal static class SetupEngine
                 ExtractVerifiedPayload(staging);
                 if (TryReadSpaceLensVersion(InstalledExecutable, out var installedVersion) && installedVersion > SetupVersion) throw new InvalidOperationException($"A newer SpaceLens version ({installedVersion.ToString(3)}) is already installed. Setup {SetupVersionText} will not downgrade it.");
                 if (File.Exists(InstalledExecutable)) File.Move(InstalledExecutable, backup, true);
+                VerifyPayloadFile(staging);
+                ValidateInstallDirectoryChain();
                 File.Move(staging, InstalledExecutable, true); replaced = true;
+                VerifyPayloadFile(InstalledExecutable);
                 Shortcut.Create(StartMenuShortcut, InstalledExecutable, InstallDirectory, "Analyze disk space with SpaceLens");
                 if (createDesktopShortcut) Shortcut.Create(DesktopShortcut, InstalledExecutable, InstallDirectory, "Analyze disk space with SpaceLens"); else TryDelete(DesktopShortcut);
                 RegisterUninstaller(); WriteAutomaticUpdatePreference(enableAutomaticUpdates); TryDelete(backup);
@@ -131,6 +174,24 @@ internal static class SetupEngine
         var version = Assembly.GetExecutingAssembly().GetName().Version ?? throw new InvalidOperationException("Setup version metadata is missing.");
         if (version.Major < 0 || version.Minor < 0 || version.Build < 0 || version.Revision != 0) throw new InvalidOperationException("Setup version metadata must be a strict three-part version.");
         return new Version(version.Major, version.Minor, version.Build);
+    }
+
+    private static void ValidateInstallDirectoryChain()
+    {
+        string localRoot = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string installRoot = Path.GetFullPath(InstallDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (!installRoot.StartsWith(localRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new SecurityException("The per-user install directory is outside Local AppData.");
+
+        DirectoryInfo? current = new(installRoot);
+        while (current is not null && current.FullName.Length > localRoot.Length)
+        {
+            if (current.Exists && (current.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new SecurityException("Setup refused an install path containing a junction or symbolic link.");
+            current = current.Parent;
+        }
+        if (current is null || !Path.GetFullPath(current.FullName).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Equals(localRoot, StringComparison.OrdinalIgnoreCase))
+            throw new SecurityException("The per-user install directory failed its ancestry check.");
     }
 
     private sealed class UpdatePreference
@@ -222,10 +283,36 @@ internal static class SetupEngine
     private static void ExtractVerifiedPayload(string destination)
     {
         TryDelete(destination); using Stream source = Resource("SpaceLens.Payload.exe"); using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.WriteThrough)) { source.CopyTo(output); output.Flush(true); }
+        try { VerifyPayloadFile(destination); }
+        catch { TryDelete(destination); throw; }
+    }
+
+    private static string ExpectedPayloadHash()
+    {
         string expected; using (var reader = new StreamReader(Resource("SpaceLens.Payload.sha256"))) expected = reader.ReadToEnd().Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)[0].ToUpperInvariant();
-        using var input = File.OpenRead(destination); string actual = Convert.ToHexString(SHA256.HashData(input)); if (actual != expected) { TryDelete(destination); throw new InvalidDataException("The embedded SpaceLens application failed its integrity check."); }
-        using var check = File.OpenRead(destination); if (check.ReadByte() != 'M' || check.ReadByte() != 'Z') throw new InvalidDataException("The embedded application is not a valid Windows executable.");
-        ValidatePayloadIdentity(destination);
+        if (expected.Length != 64 || !expected.All(Uri.IsHexDigit)) throw new InvalidDataException("The embedded application checksum is invalid.");
+        return expected;
+    }
+
+    private static void VerifyPayloadFile(string path)
+    {
+        using FileStream stream = OpenVerifiedPayloadForLaunch(path);
+    }
+
+    internal static FileStream OpenVerifiedPayloadForLaunch(string path)
+    {
+        FileStream? stream = null;
+        try
+        {
+            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
+            if (stream.ReadByte() != 'M' || stream.ReadByte() != 'Z') throw new InvalidDataException("The embedded application is not a valid Windows executable.");
+            stream.Position = 0;
+            byte[] expected = Convert.FromHexString(ExpectedPayloadHash()), actual = SHA256.HashData(stream);
+            if (!CryptographicOperations.FixedTimeEquals(expected, actual)) throw new InvalidDataException("The embedded SpaceLens application failed its integrity check.");
+            ValidatePayloadIdentity(path);
+            stream.Position = 0; FileStream verified = stream; stream = null; return verified;
+        }
+        finally { stream?.Dispose(); }
     }
 
     private static Stream Resource(string name) => Assembly.GetExecutingAssembly().GetManifestResourceStream(name) ?? throw new InvalidDataException($"Setup resource is missing: {name}");
@@ -238,9 +325,19 @@ internal static class SetupEngine
 
     private sealed class FileState
     {
+        private const int MaximumRollbackFileBytes = 1024 * 1024;
         private readonly bool existed; private readonly byte[]? contents;
         private FileState(bool existed, byte[]? contents) { this.existed = existed; this.contents = contents; }
-        internal static FileState Capture(string path) => File.Exists(path) ? new(true, File.ReadAllBytes(path)) : new(false, null);
+        internal static FileState Capture(string path)
+        {
+            if (!File.Exists(path)) return new(false, null);
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
+            if (file.Length < 0 || file.Length > MaximumRollbackFileBytes) throw new InvalidDataException("An existing installer rollback file is unexpectedly large.");
+            byte[] contents = new byte[checked((int)file.Length)];
+            file.ReadExactly(contents);
+            if (file.ReadByte() != -1) throw new InvalidDataException("An installer rollback file changed while it was being captured.");
+            return new(true, contents);
+        }
         internal void Restore(string path)
         {
             if (!existed) { if (File.Exists(path)) File.Delete(path); return; }
@@ -289,11 +386,25 @@ internal static class SetupEngine
         string directory = Path.Combine(Path.GetTempPath(), "SpaceLens-Setup-Test-" + Guid.NewGuid().ToString("N"));
         try
         {
+            if (!SetupProcessSecurity.ShouldRefuseInstall(true) || SetupProcessSecurity.ShouldRefuseInstall(false)) return false;
+            if (!IsOwnedTemporarySetupName($"SpaceLens-Setup-{SetupVersionText}-0123456789abcdef0123456789abcdef.exe") || IsOwnedTemporarySetupName("SpaceLens-Setup-not-a-guid.exe") || IsOwnedTemporarySetupName($"SpaceLens-Uninstall-{SetupVersionText}-0123456789abcdef0123456789abcdef.exe")) return false;
             Directory.CreateDirectory(directory); string payload = Path.Combine(directory, "SpaceLens.exe"); ExtractVerifiedPayload(payload); string shortcut = Path.Combine(directory, "SpaceLens.lnk"); Shortcut.Create(shortcut, payload, directory, "SpaceLens test");
-            using var process = Process.Start(new ProcessStartInfo(payload) { UseShellExecute = false, ArgumentList = { "--self-test" } });
-            if (process is null) return false;
-            if (!process.WaitForExit(60000)) { try { process.Kill(true); process.WaitForExit(5000); } catch { } return false; }
-            if (process.ExitCode != 0) return false;
+            using (FileStream payloadLock = OpenVerifiedPayloadForLaunch(payload))
+            {
+                bool lockedAgainstWrite = false;
+                try { using FileStream _ = new(payload, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+                catch (IOException) { lockedAgainstWrite = true; }
+                catch (UnauthorizedAccessException) { lockedAgainstWrite = true; }
+                if (!lockedAgainstWrite) return false;
+                using var process = Process.Start(new ProcessStartInfo(payload) { UseShellExecute = false, ArgumentList = { "--self-test" } });
+                if (process is null) return false;
+                if (!process.WaitForExit(60000)) { try { process.Kill(true); process.WaitForExit(5000); } catch { } return false; }
+                if (process.ExitCode != 0) return false;
+            }
+            using (var tamper = new FileStream(payload, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { tamper.Position = 2; int value = tamper.ReadByte(); tamper.Position = 2; tamper.WriteByte(unchecked((byte)(value ^ 0xFF))); tamper.Flush(true); }
+            bool tamperedRejected = false; try { using FileStream _ = OpenVerifiedPayloadForLaunch(payload); } catch (InvalidDataException) { tamperedRejected = true; }
+            if (!tamperedRejected) return false;
+            ExtractVerifiedPayload(payload);
             string? shortcutTarget = Shortcut.ReadTarget(shortcut); var payloadVersion = ValidatePayloadIdentity(payload);
             using var form = new SetupForm(true); if (form.Handle == IntPtr.Zero) return false;
             bool updateChoiceVisible = form.Controls.OfType<CheckBox>().Any(control => control.Text.StartsWith("Check for updates automatically", StringComparison.Ordinal));
@@ -310,11 +421,27 @@ internal static class SetupEngine
         try
         {
             string full = Path.GetFullPath(self), temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar), name = Path.GetFileName(full);
-            if (!Path.GetDirectoryName(full)!.Equals(temp, StringComparison.OrdinalIgnoreCase) || !name.StartsWith("SpaceLens-Setup-", StringComparison.Ordinal) || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
-            string script = Path.Combine(temp, $"SpaceLens-Update-Cleanup-{Guid.NewGuid():N}.cmd"); File.WriteAllText(script, $"@echo off\r\nfor /L %%i in (1,1,20) do (\r\n  del /f /q \"{full}\" >nul 2>&1\r\n  if not exist \"{full}\" goto done\r\n  ping 127.0.0.1 -n 2 >nul\r\n)\r\n:done\r\ndel /f /q \"%~f0\"\r\n");
-            var start = new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden }; start.ArgumentList.Add("/d"); start.ArgumentList.Add("/c"); start.ArgumentList.Add(script); Process.Start(start);
+            if (!Path.GetDirectoryName(full)!.Equals(temp, StringComparison.OrdinalIgnoreCase) || !IsOwnedTemporarySetupName(name)) return;
+            string powershell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+            if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell is unavailable.", powershell);
+            var start = new ProcessStartInfo(powershell) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
+            start.ArgumentList.Add("-NoLogo"); start.ArgumentList.Add("-NoProfile"); start.ArgumentList.Add("-NonInteractive"); start.ArgumentList.Add("-WindowStyle"); start.ArgumentList.Add("Hidden"); start.ArgumentList.Add("-Command");
+            start.ArgumentList.Add("$p=$env:SPACELENS_SELF_DELETE_TARGET; for($i=0;$i -lt 20 -and (Test-Path -LiteralPath $p);$i++){ Start-Sleep -Milliseconds 500; Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }");
+            start.Environment["SPACELENS_SELF_DELETE_TARGET"] = full;
+            using Process? process = Process.Start(start);
+            if (process is null) throw new InvalidOperationException("Windows could not schedule Setup cleanup.");
         }
         catch { }
+    }
+
+    private static bool IsOwnedTemporarySetupName(string name)
+    {
+        const string prefix = "SpaceLens-Setup-";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return false;
+        string payload = name[prefix.Length..^4], versionPrefix = SetupVersionText + "-";
+        if (!payload.StartsWith(versionPrefix, StringComparison.Ordinal)) return false;
+        string token = payload[versionPrefix.Length..];
+        return token.Length == 32 && token.All(Uri.IsHexDigit);
     }
 }
 

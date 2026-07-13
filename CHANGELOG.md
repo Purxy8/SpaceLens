@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 1.6.1 — 2026-07-13
+
+- Retired and removed the obsolete development private key, completed a one-shot maintainer-run CNG trust rotation, and enrolled a new public key plus freshly signed self-test fixture. Upgrading from 1.6.0 or earlier requires one manual installer download from the official GitHub release.
+- Split build/self-test and offline manifest signing into separate phases bound by a clean source commit, an independently copied prepared-ZIP digest, and exact per-input SHA-256/size provenance.
+- Added support for a non-exportable, high-protection Windows CNG ECDSA P-256 signing key; the private key is never exported to a standalone file, and exportable private PEM commands hard-fail.
+- Hardened ReleaseSigner with bounded strict inputs, P-256 enforcement, exclusive output creation, a single sign-and-public-key-verify operation, negative self-tests, and disabled .NET startup hooks.
+- Removed all product-binary execution from the offline key account; the finalizer validates product bytes and launches only the independently hashed, locked NativeAOT signer.
+- Pinned active GitHub Actions to reviewed full commit SHAs, removed persisted checkout credentials, retained least-privilege permissions, and retired the unsafe single-runner SignPath design in favor of an inert no-secret placeholder pending a separately audited split-job architecture.
+- Added CI regression checks for action pinning, secret/PR isolation, workspace-local signing keys, exact-input hash rejection, and production apphost resistance to `DOTNET_STARTUP_HOOKS`.
+- Temporarily disabled and retired the Full access/UAC helper pending a native broker; helper entry points fail closed while ordinary scanning, UI, cleanup, update, install, and uninstall stay unelevated and reject elevated operation.
+- Hardened preserved scan protocol validation with root identity binding, cumulative IPC frame/byte/file/time budgets, and case-sensitive canonical containment.
+- Tightened the updater to an exact HTTPS redirect allowlist with locked installer rehash-through-launch, and hardened Setup/uninstall staging, ownership, identity, and canonical path validation.
+- Bounded live/cache results to 2 million files and 192 million path characters, bounded native/fallback directory traversal and file-type aggregation, and prevented oversized or adversarial trees from exhausting memory.
+- Fixed managed fallback cancellation being swallowed as a completed partial scan, preserved the last partial batch when a traversal budget stops a scan, and narrowed broad filesystem catches so fatal failures propagate.
+- Split the interactive network timeout into one minute for update checks and ten minutes for installer downloads.
+
 ## 1.6.0 — 2026-07-12
 
 - Added conservative NTFS Quick Refresh after a saved whole-drive full-access scan: the elevated helper reads closed-file journal records, reopens every changed live file by stable ID, and automatically performs a complete scan when Windows reports detected uncertainty in the journal, directory tree, hard links, streams, identities, containment, or drive accounting. Because NTFS can coalesce writes while another application keeps a file open, the interface always offers a Complete rescan for an exact freshly rebuilt snapshot.

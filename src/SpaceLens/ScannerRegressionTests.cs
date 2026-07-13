@@ -51,7 +51,7 @@ internal static class ScannerRegressionTests
 
             string allocationProbe = Path.Combine(root, "allocation-probe.bin");
             byte[] probeContent = new byte[1024 * 1024];
-            Random.Shared.NextBytes(probeContent);
+            System.Security.Cryptography.RandomNumberGenerator.Fill(probeContent);
             File.WriteAllBytes(allocationProbe, probeContent);
             expectedLogicalBytes += probeContent.Length;
             expectedFileCount++;

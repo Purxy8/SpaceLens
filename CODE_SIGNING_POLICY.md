@@ -10,7 +10,7 @@ For releases produced after acceptance:
 
 The Authenticode publisher will therefore be SignPath Foundation. A valid signature proves that the binary was signed under that approved publisher identity and was not modified afterward. The separately verified GitHub workflow metadata and artifact digest bind the binary to its reviewed source and signing run. Neither check replaces normal review of what the application does.
 
-The signing workflow remains disabled until Foundation onboarding is complete and every GitHub Actions `uses:` reference is pinned to an audited full commit SHA. Authenticode removes the anonymous **Unknown publisher** identity, but Windows SmartScreen can still show a reputation warning for a new certificate or newly released application until reputation develops.
+Every active GitHub Actions `uses:` reference is pinned to a reviewed full commit SHA, and checkout credentials are not persisted. No usable SignPath workflow exists. The former single-runner design was retired because it mixed product execution with later token access; the remaining workflow is an inert literal-false placeholder with no checkout, actions, or secrets. A future split-job design requires a new independent review in addition to Foundation onboarding. Authenticode can remove the anonymous **Unknown publisher** identity, but SmartScreen may still warn while reputation develops.
 
 ## Source and signed artifacts
 
@@ -20,6 +20,8 @@ The canonical source repository is [Purxy8/SpaceLens](https://github.com/Purxy8/
 - `SpaceLens-Setup.exe`
 
 Signing is requested only for artifacts built from committed source by a GitHub-hosted GitHub Actions runner. `SpaceLens.exe` is signed first. Setup is then built with that exact signed application and its SHA-256 sidecar embedded, after which `SpaceLens-Setup.exe` is signed. The separately ECDSA-signed `update.json` is created offline only after the final signed Setup size and SHA-256 are known.
+
+Manifest signing is isolated from builds and product execution. The only production key type is a non-exportable, high-protection current-user Windows CNG ECDSA P-256 key created by the maintainer from a normal interactive account, never an agent/runner/service identity. The old development key was retired, and the maintainer completed the one-shot 1.6.1 CNG rotation by committing only the new public key plus its freshly signed self-test fixture. Exportable private PEM commands hard-fail.
 
 The SignPath artifact configurations restrict the file names and enforce `SpaceLens` product metadata plus the repository's centrally declared release version. Every Foundation signing request requires manual approval. Locally built, modified, diagnostic, or uncommitted binaries are never submitted for release signing.
 

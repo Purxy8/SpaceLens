@@ -26,6 +26,8 @@ $signPathRoot = [IO.Path]::GetFullPath((Join-Path $artifacts 'signpath'))
 $versionProperties = Join-Path $repository 'Directory.Build.props'
 $appProject = Join-Path $repository 'src\SpaceLens\SpaceLens.csproj'
 $setupProject = Join-Path $repository 'src\SpaceLens.Setup\SpaceLens.Setup.csproj'
+$publicKey = Join-Path $repository 'src\SpaceLens\assets\update-public-key.pem'
+$securityModule = Join-Path $PSScriptRoot 'ReleaseSecurity.psm1'
 
 $unsignedAppDirectory = Join-Path $signPathRoot 'unsigned-app'
 $signedAppDirectory = Join-Path $signPathRoot 'signed-app'
@@ -35,11 +37,13 @@ $appPublishDirectory = Join-Path $signPathRoot 'app-publish'
 $setupPublishDirectory = Join-Path $signPathRoot 'setup-publish'
 $finalDirectory = Join-Path $signPathRoot 'final'
 
-foreach ($required in @($versionProperties, $appProject, $setupProject)) {
+foreach ($required in @($versionProperties, $appProject, $setupProject, $publicKey, $securityModule)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required file is missing: $required"
     }
 }
+Import-Module $securityModule -Force
+Assert-PublicSpkiPemFile -Path $publicKey | Out-Null
 
 [xml]$propertiesDocument = Get-Content -Raw -LiteralPath $versionProperties
 $versionNodes = @($propertiesDocument.SelectNodes('/Project/PropertyGroup/SpaceLensVersion'))
@@ -64,7 +68,7 @@ function Get-OwnedChildPath {
         [IO.Path]::AltDirectorySeparatorChar
     ))
     $prefix = $fullParent + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $fullPath.StartsWith($prefix, [StringComparison]::Ordinal)) {
         throw "Refusing to manage a path outside $fullParent`: $fullPath"
     }
 
@@ -332,6 +336,7 @@ switch ($Stage) {
         Copy-Item -LiteralPath $publishedApp -Destination $unsignedApp
         Assert-UnsignedExecutable -Path $unsignedApp
         Invoke-PackagedExecutable -Path $unsignedApp -Description 'Unsigned SpaceLens packaged self-test'
+        & (Join-Path $PSScriptRoot 'Test-StartupHookIsolation.ps1') -Executable $unsignedApp -WorkDirectory $signPathRoot
         Assert-DirectoryContainsOnly -Directory $unsignedAppDirectory -Names @('SpaceLens.exe')
     }
 
