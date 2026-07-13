@@ -57,6 +57,12 @@ This phase publishes and self-tests SpaceLens and Setup, runs the harmless start
 
 Copy the prepared ZIP and native signer to separate external locations. Copy both displayed digests independently; do not trust adjacent sidecars alone.
 
+If the maintainer machine does not have the Visual C++ linker required for NativeAOT, run **Prepare verified release inputs** manually from the GitHub Actions page on the exact `main` commit. Paste that reviewed 40-character commit into `expected_source_sha`; the job fails if `main` resolves elsewhere. The workflow is restricted to the repository owner on `main`, has read-only repository permission, receives no configured repository or environment secrets, runs the same build and packaged self-tests, and uploads the prepared ZIP and its SHA-256 sidecar as two separately named three-day artifacts.
+
+For each download, first verify the GitHub API's digest of the outer Actions artifact ZIP and require that wrapper ZIP to contain exactly one expected entry. Then hash the extracted inner prepared release ZIP and compare it with the sidecar extracted from the separately downloaded digest artifact; pass that inner ZIP digest to `Finalize-Release.ps1`. Apply the same outer-artifact-digest, exact-one-entry, and separate-sidecar checks to the NativeAOT signer artifacts from the canonical `Build and self-test` push run for the same source commit.
+
+This workflow trusts the reviewed pinned GitHub actions, the exact .NET SDK version, and the GitHub-hosted Windows runner image. Separate artifacts and digests prevent accidental substitution and detect transport corruption; they are not an independent rebuild or a defense against a compromised hosted builder. A future release process can add a separately operated reproducible build comparison or artifact attestation without granting the product-build job any signing secret.
+
 SpaceLens 1.6.1 intentionally disables Full access/UAC while a native broker is designed. The historical elevated probe is not applicable. Verify instead that helper entry points reject activation and that normal app, update, cleanup, install, and uninstall flows remain unelevated. Version 1.6.1 never requests UAC; cancel and report any unexpected prompt.
 
 ## Offline CNG finalization
