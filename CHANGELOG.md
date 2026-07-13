@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-## 1.6.1 — 2026-07-12
+## 1.6.1 — 2026-07-13
 
-- Retired and removed the obsolete development private key, added a one-shot maintainer-run CNG trust-rotation handoff, and blocked release until a new public key plus freshly signed self-test fixture are enrolled. Once completed, upgrading from 1.6.0 or earlier requires one manual installer download from the official GitHub release.
+- Retired and removed the obsolete development private key, completed a one-shot maintainer-run CNG trust rotation, and enrolled a new public key plus freshly signed self-test fixture. Upgrading from 1.6.0 or earlier requires one manual installer download from the official GitHub release.
 - Split build/self-test and offline manifest signing into separate phases bound by a clean source commit, an independently copied prepared-ZIP digest, and exact per-input SHA-256/size provenance.
-- Added support for a non-exportable, high-protection Windows CNG ECDSA P-256 signing key; the private key never becomes a file and exportable private PEM commands hard-fail.
+- Added support for a non-exportable, high-protection Windows CNG ECDSA P-256 signing key; the private key is never exported to a standalone file, and exportable private PEM commands hard-fail.
 - Hardened ReleaseSigner with bounded strict inputs, P-256 enforcement, exclusive output creation, a single sign-and-public-key-verify operation, negative self-tests, and disabled .NET startup hooks.
 - Removed all product-binary execution from the offline key account; the finalizer validates product bytes and launches only the independently hashed, locked NativeAOT signer.
 - Pinned active GitHub Actions to reviewed full commit SHAs, removed persisted checkout credentials, retained least-privilege permissions, and retired the unsafe single-runner SignPath design in favor of an inert no-secret placeholder pending a separately audited split-job architecture.

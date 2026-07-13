@@ -11,7 +11,7 @@ Never create or upload exportable private key material. The release tools hard-f
 
 ## One-time 1.6.1 trust reset
 
-The previous development key is retired. Version 1.6.1 must not be published until the maintainer completes this handoff. Existing clients cannot securely authenticate a replacement key using the old trust anchor, so users of 1.6.0 or earlier must install 1.6.1 manually from the official release.
+The previous development key is retired, and the maintainer completed this one-time handoff for 1.6.1. Do not publish from a source commit unless the matching public key and freshly signed fixture are committed and verified. Existing clients cannot securely authenticate a replacement key using the old trust anchor, so users of 1.6.0 or earlier must install 1.6.1 manually from the official release.
 
 From the reviewed clean commit, build the NativeAOT signer to an otherwise empty external directory and record its SHA-256 through a separate trusted channel:
 

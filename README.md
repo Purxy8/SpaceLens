@@ -47,7 +47,7 @@ The current public builds are not Authenticode-signed, so Windows SmartScreen ma
 
 SpaceLens 1.6 uses a validated v7 cache and can migrate v6, v5, v4, and v3 saved scans from earlier releases. Existing NTFS checkpoints are retained for compatibility, but 1.6.1 does not activate the elevated refresh helper.
 
-**1.6.1 security bootstrap:** the previous development signing key is being retired and must be replaced before publication. Consequently, 1.6.0 and earlier must install 1.6.1 manually from the official GitHub release and verify its SHA-256 sidecar; do not rely solely on the old in-app update prompt for this transition. Later releases can again use the new key pinned by 1.6.1.
+**1.6.1 security bootstrap:** the previous development signing key was retired and replaced with a new non-exportable, user-protected CNG key. Because 1.6.0 and earlier cannot securely authenticate this trust-anchor change, they must install 1.6.1 manually from the official GitHub release and verify its SHA-256 sidecar; do not rely solely on the old in-app update prompt for this transition. Later releases can again use the new key pinned by 1.6.1.
 
 ## Build from source
 
