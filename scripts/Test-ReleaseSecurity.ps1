@@ -186,7 +186,7 @@ try {
         throw 'The SignPath workflow safety lock is missing.'
     }
     foreach ($line in ($signWorkflow -split "`r?`n")) {
-        if ($line -match '^\s*uses:\s*(?<action>\S+)') {
+        if ($line -match '^\s*(?:-\s*)?uses\s*:\s*(?<action>\S+)') {
             $action = $Matches.action
             if ($action -notmatch '@[0-9a-fA-F]{40}$') {
                 throw "Third-party action is not pinned to a full commit SHA: $action"
@@ -228,9 +228,15 @@ try {
             throw "$($workflow.Name) combines pull-request code execution with repository secrets."
         }
         foreach ($line in ($workflowText -split "`r?`n")) {
-            if ($line -match '^\s*uses:\s*(?<action>\S+)' -and $Matches.action -notmatch '@[0-9a-fA-F]{40}$') {
+            if ($line -match '^\s*(?:-\s*)?uses\s*:\s*(?<action>\S+)' -and $Matches.action -notmatch '@[0-9a-fA-F]{40}$') {
                 throw "$($workflow.Name) contains an unpinned action: $($Matches.action)"
             }
+        }
+        if ($workflowText -match '(?im)^\s*-\s*\{[^}\r\n]*\buses\s*:') {
+            throw "$($workflow.Name) uses a flow-style action step that the pinning audit does not allow."
+        }
+        if ($workflowText -match '(?im)^\s*(?:-\s*)?(?:"(?:uses|run)"|''(?:uses|run)'')\s*:') {
+            throw "$($workflow.Name) uses a quoted executable step key that the workflow audit does not allow."
         }
     }
 
@@ -260,6 +266,104 @@ try {
     }
     if ($ciWorkflow -match '\$\{\{\s*secrets\.' -or $ciWorkflow -match '(?im)^\s*[a-z-]+\s*:\s*write\s*$') {
         throw 'Read-only CI signer delivery must not access secrets or request write permissions.'
+    }
+
+    $prepareWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repository '.github\workflows\prepare-release.yml')
+    $normalizedPrepareWorkflow = $prepareWorkflow.Replace("`r`n", "`n").Replace("`r", "`n")
+    $prepareHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actualPrepareWorkflowHash = ([BitConverter]::ToString($prepareHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($normalizedPrepareWorkflow)))).Replace('-', '')
+    }
+    finally {
+        $prepareHasher.Dispose()
+    }
+    if ($actualPrepareWorkflowHash -cne 'FF59BB1A310FFAA59756B6295EFE7EAFC42C66FD7EA2777F7E4D5E144A5B4AF3') {
+        throw 'The manually dispatched release workflow changed without an explicit normalized-content security review.'
+    }
+    if ($prepareWorkflow -notmatch '(?m)^\s*workflow_dispatch\s*:\s*$' -or
+        $prepareWorkflow -match '(?m)^\s*(push|pull_request|pull_request_target)\s*:\s*$') {
+        throw 'Release preparation must be manual-only and never execute for push or pull-request events.'
+    }
+    $prepareGate = "if: `${{ github.event_name == 'workflow_dispatch' && github.repository == 'Purxy8/SpaceLens' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}"
+    if ([regex]::Matches($prepareWorkflow, [regex]::Escape($prepareGate)).Count -ne 1) {
+        throw 'Release preparation must be restricted to the repository owner on the exact main branch.'
+    }
+    if ($prepareWorkflow -match '\$\{\{\s*secrets\.' -or
+        $prepareWorkflow -match '(?im)^\s*[a-z-]+\s*:\s*write\s*$' -or
+        $prepareWorkflow -notmatch '(?m)^permissions:\s*\r?\n\s+contents:\s*read\s*$') {
+        throw 'Release preparation must use a read-only token and no repository secrets.'
+    }
+    $checkoutAction = 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd'
+    $setupDotnetAction = 'actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7'
+    if ($prepareWorkflow -notmatch '(?m)^\s+persist-credentials:\s*false\s*$' -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?uses:\s*' + [regex]::Escape($checkoutAction) + '(?:\s+#.*)?$').Count -ne 1 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?uses:\s*' + [regex]::Escape($setupDotnetAction) + '(?:\s+#.*)?$').Count -ne 1 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?uses:\s*' + [regex]::Escape($uploadAction) + '(?:\s+#.*)?$').Count -ne 2 -or
+        $prepareWorkflow -notmatch '(?m)^\s*\.\\scripts\\Build-Release\.ps1 -PrepareOfflineRelease -Notes \$env:RELEASE_NOTES\s*$') {
+        throw 'Release preparation must use the reviewed checkout, exact build command, and two pinned uploads.'
+    }
+    $jobsBlock = [regex]::Match($prepareWorkflow, '(?ms)^jobs:\s*\r?\n(?<body>.*)\z')
+    $jobKeys = @()
+    if ($jobsBlock.Success) {
+        $jobKeys = @([regex]::Matches($jobsBlock.Groups['body'].Value, '(?m)^  (?:(?:"(?<job>[A-Za-z0-9_-]+)"|''(?<job>[A-Za-z0-9_-]+)''|(?<job>[A-Za-z0-9_-]+))):(?:\s.*)?$') | ForEach-Object { $_ })
+    }
+    if (-not $jobsBlock.Success -or $jobKeys.Count -ne 1 -or $jobKeys[0].Groups['job'].Value -cne 'windows-prepare' -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+runs-on\s*:').Count -ne 1 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+runs-on:\s*windows-latest\s*$').Count -ne 1 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?uses\s*:').Count -ne 4 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?uses:\s*\S+@[0-9a-fA-F]{40}(?:\s+#.*)?$').Count -ne 4 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?run\s*:').Count -ne 2 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s+(?:-\s*)?run:\s*\|\s*$').Count -ne 2 -or
+        $prepareWorkflow -match '(?m)^\s*-\s*\{' -or
+        $prepareWorkflow -match '(?m)^\s*(continue-on-error|container|services|strategy)\s*:') {
+        throw 'Release preparation must remain one bounded Windows job with only the reviewed steps.'
+    }
+    $shorthandUsesProbe = "      - uses: actions/cache@0000000000000000000000000000000000000000"
+    if ($shorthandUsesProbe -notmatch '^\s*(?:-\s*)?uses:\s*(?<action>\S+)' -or
+        [regex]::Matches($shorthandUsesProbe, '(?m)^\s+(?:-\s*)?uses\s*:').Count -ne 1) {
+        throw 'Release workflow guards do not recognize YAML shorthand action steps.'
+    }
+    if ('      - uses : actions/cache@main' -notmatch '^\s*(?:-\s*)?uses\s*:\s*(?<action>\S+)') {
+        throw 'Release workflow guards do not recognize whitespace before an action-step colon.'
+    }
+    if ([regex]::Matches('      - run: Write-Host unsafe', '(?m)^\s+(?:-\s*)?run\s*:').Count -ne 1) {
+        throw 'Release workflow guards do not recognize YAML shorthand command steps.'
+    }
+    if ([regex]::Matches($prepareWorkflow, '\$\{\{\s*inputs\.release_notes\s*\}\}').Count -ne 1 -or
+        $prepareWorkflow -notmatch '(?m)^\s*RELEASE_NOTES:\s*\$\{\{\s*inputs\.release_notes\s*\}\}\s*$') {
+        throw 'Manual release notes must cross the Actions expression boundary only through an environment value.'
+    }
+    if ([regex]::Matches($prepareWorkflow, '\$\{\{\s*inputs\.expected_source_sha\s*\}\}').Count -ne 1 -or
+        $prepareWorkflow -notmatch '(?m)^\s*EXPECTED_SOURCE_SHA:\s*\$\{\{\s*inputs\.expected_source_sha\s*\}\}\s*$' -or
+        $prepareWorkflow -notmatch '(?m)^\s*-not \[string\]::Equals\(\$env:EXPECTED_SOURCE_SHA, \$env:GITHUB_SHA, \[StringComparison\]::OrdinalIgnoreCase\)\) \{\s*$') {
+        throw 'Release preparation must fail closed unless the dispatch names the exact checked-out source SHA.'
+    }
+    if ($prepareWorkflow -match '(?is)\$\{\{.*?\bsecrets\b.*?\}\}' -or
+        $prepareWorkflow -match '(?i)\bgithub\s*(?:\.\s*token|\[\s*[''"]token[''"]\s*\])' -or
+        $prepareWorkflow -match '(?i)\bgithub\s*\[' -or
+        $prepareWorkflow -match '(?i)\btoJSON\s*\(\s*github\s*\)' -or
+        $prepareWorkflow -match '(?i)\bGITHUB_TOKEN\b') {
+        throw 'Release preparation must not explicitly consume configured secrets or the automatic GitHub token.'
+    }
+    if ('${{ toJSON(github) }}' -notmatch '(?i)\btoJSON\s*\(\s*github\s*\)') {
+        throw 'Release workflow guards do not recognize serialization of the token-bearing GitHub context.'
+    }
+    foreach ($preparedUploadControl in @(
+        'if-no-files-found: error',
+        'retention-days: 3',
+        'compression-level: 0',
+        'overwrite: false',
+        'include-hidden-files: false'
+    )) {
+        if ([regex]::Matches($prepareWorkflow, [regex]::Escape($preparedUploadControl)).Count -ne 2) {
+            throw "Both prepared release artifacts must enforce: $preparedUploadControl"
+        }
+    }
+    if ($prepareWorkflow -notmatch 'SpaceLens-ReleaseInput-\$\{\{ steps\.metadata\.outputs\.version \}\}-\$\{\{ github\.sha \}\}' -or
+        $prepareWorkflow -notmatch 'SpaceLens-ReleaseInput-SHA256-\$\{\{ steps\.metadata\.outputs\.version \}\}-\$\{\{ github\.sha \}\}' -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s*path:\s*artifacts/intermediate/SpaceLens-release-input-v\$\{\{ steps\.metadata\.outputs\.version \}\}\.zip\s*$').Count -ne 1 -or
+        [regex]::Matches($prepareWorkflow, '(?m)^\s*path:\s*artifacts/intermediate/SpaceLens-release-input-v\$\{\{ steps\.metadata\.outputs\.version \}\}\.zip\.sha256\s*$').Count -ne 1) {
+        throw 'Prepared release artifacts must be separately named and bound to version plus exact source SHA.'
     }
 
     $codeQlWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repository '.github\workflows\codeql.yml')
