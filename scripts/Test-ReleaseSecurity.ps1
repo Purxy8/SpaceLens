@@ -79,6 +79,7 @@ try {
     $outsideKey = Join-Path $outsideDirectory 'dummy-private.pem'
     [IO.File]::WriteAllText($insideKey, 'test-only-no-private-material', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($outsideKey, 'test-only-no-private-material', [Text.UTF8Encoding]::new($false))
+    Assert-ReleasePathHasNoReparsePoints -Path $insideKey -StopAt $repository
 
     Assert-Throws -Action { Assert-PrivateKeyOutsideWorkspace -SigningKey $insideKey -Repository $repository } -ExpectedPattern 'inside the repository or workspace'
     Assert-Throws -Action { Assert-NewKeyPathOutsideWorkspace -Path (Join-Path $insideDirectory 'new-private.pem') -Repository $repository } -ExpectedPattern 'inside the repository or workspace'

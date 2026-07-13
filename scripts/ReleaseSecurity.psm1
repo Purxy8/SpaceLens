@@ -227,7 +227,7 @@ function Assert-ReleasePathHasNoReparsePoints {
             throw "Refusing to manage a path through a reparse point: $($current.FullName)"
         }
         if ([string]::Equals((Get-NormalizedReleasePath -Path $current.FullName), $fullStop, [StringComparison]::Ordinal)) { return }
-        $current = $current.Parent
+        $current = if ($current -is [IO.DirectoryInfo]) { $current.Parent } else { $current.Directory }
     }
     throw "Path ancestry did not reach its expected owner: $fullPath"
 }
