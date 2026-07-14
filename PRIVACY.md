@@ -1,6 +1,6 @@
 # SpaceLens privacy policy
 
-Effective date: July 12, 2026
+Effective date: July 14, 2026
 
 SpaceLens is a local Windows disk-space analyzer. It does not contain advertising, analytics, telemetry, user accounts, or a remote scanning service.
 
@@ -10,7 +10,7 @@ Scanning and categorization happen on the user's computer. File and folder paths
 
 SpaceLens stores saved scan data, its update preference, and any crash log under `%LOCALAPPDATA%\SpaceLens`. The normal uninstaller offers to remove this saved data. Files selected for cleanup are passed to the local Windows Recycle Bin; SpaceLens does not send their contents anywhere.
 
-SpaceLens 1.6.1 does not start an Administrator helper. The former Full access scan is retired/temporarily unavailable while a native broker is designed. Standard scanning, cleanup, updates, installation, and uninstall remain local and unelevated.
+SpaceLens 1.6.2 does not start an Administrator helper. The former Full access scan is retired/temporarily unavailable while a native broker is designed. Standard scanning, folder/game aggregation, cleanup, updates, installation, and uninstall remain local and unelevated.
 
 ## Network activity
 

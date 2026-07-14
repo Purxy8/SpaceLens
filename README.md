@@ -13,8 +13,9 @@ SpaceLens is a friendly Windows disk-space analyzer. It scans a drive or folder,
 - Categories for downloads, temporary files and caches, apps and games, Windows/system files, and personal files, plus independent screenshot and video filters
 - Category, media, search, and size sorting controls that remain independent and composable
 - Fast extended Windows directory scanning with direct file IDs/reparse tags, live files-per-second feedback, cancellation, background filtering/sorting, and a virtualized largest-files table
+- A **Folders & games** view that totals every matching indexed file, detects common game/application install roots, and drills into ordinary folders without being limited to the 10,000 largest individual files
 - Bounded scan, directory, cache, path-memory, and file-type aggregation workloads that stop safely instead of exhausting memory on adversarial or exceptionally large trees
-- Standard unelevated scanning only in 1.6.1; the former **Full access / NTFS refresh (Administrator)** helper is temporarily disabled while it is replaced by a native broker
+- Standard unelevated scanning only in 1.6.2; the former **Full access / NTFS refresh (Administrator)** helper is temporarily disabled while it is replaced by a native broker
 - Visible Normal, Important, and Protected safety notes plus a dedicated protected-item filter
 - Validated completed-scan caching so the last results can be restored without rescanning at every launch
 - Recycle Bin deletion only, with file-identity and stale-file validation plus stronger confirmation for sensitive locations
@@ -27,11 +28,15 @@ Windows drive usage is authoritative. “Files accounted” is the allocated spa
 
 SpaceLens uses decimal labels: `1 KB = 1,000 B`, `1 MB = 1,000 KB`, and `1 GB = 1,000 MB`.
 
+## Finding large games and applications
+
+The **Largest files** tab shows individual files and intentionally keeps only the 10,000 most relevant rows. A game can therefore use 80 GB without any one file being large enough to appear there. Open **Folders & games** to see recursive totals built from every matching indexed file. **Detected games & apps** groups common Steam, Xbox, Epic, GOG, EA, Ubisoft, Riot, WindowsApps, Program Files, and drive-root game libraries; **Browse scan root** covers custom folder layouts. Double-click a row to drill down. Folder rows are sorted by logical **File sizes** by default and also show unique physical **Size on disk**, which can differ for compressed, sparse, cloud, or hard-linked files.
+
 ## Safe cleanup behavior
 
 SpaceLens never deletes a file automatically. Cleanup categories are review queues, not guarantees that every listed item is disposable. A deletion action always targets the selected path, revalidates its native metadata and identity, asks for confirmation, and uses the Windows Recycle Bin. Protected Windows/system files require an exact typed confirmation phrase; application and user-state files receive a visible Important warning. SpaceLens never takes ownership, rewrites ACLs, enables deletion privileges, or falls back to permanent deletion.
 
-SpaceLens 1.6.1 keeps scanning, cleanup, updates, installation, and uninstall unelevated and rejects Administrator launches. It never requests UAC; cancel and report any unexpected SpaceLens elevation prompt. The former scan-only elevated helper is retired/temporarily unavailable pending a native broker design. A protected file can therefore be visible but remain non-recyclable when its Windows ACL denies the current app; SpaceLens reports that refusal instead of bypassing Windows protection.
+SpaceLens 1.6.2 keeps scanning, cleanup, updates, installation, and uninstall unelevated and rejects Administrator launches. It never requests UAC; cancel and report any unexpected SpaceLens elevation prompt. The former scan-only elevated helper is retired/temporarily unavailable pending a native broker design. A protected file can therefore be visible but remain non-recyclable when its Windows ACL denies the current app; SpaceLens reports that refusal instead of bypassing Windows protection.
 
 ## Install or run portable
 
@@ -39,13 +44,13 @@ On Windows 10 or 11 (64-bit):
 
 1. Download `SpaceLens-Setup.exe` from the latest release.
 2. Run it, review the privacy link and automatic-update option, and optionally create a Desktop shortcut.
-3. Start SpaceLens, select a drive or folder, and choose **Scan now**. Version 1.6.1 deliberately offers only the standard unelevated scanner; Full access/NTFS refresh remains unavailable until a safer native broker is ready.
+3. Start SpaceLens, select a drive or folder, and choose **Scan now**. Version 1.6.2 deliberately offers only the standard unelevated scanner; Full access/NTFS refresh remains unavailable until a safer native broker is ready.
 
 The release also contains a portable `SpaceLens.exe` that runs without installation. With no preference already saved for the same Windows account, a portable copy starts with automatic checks off; right-click **Check for updates** to enable or disable the at-most-daily automatic check. Installed and portable copies share that per-account preference. See the [privacy policy](PRIVACY.md) for the exact network behavior.
 
 The current public builds are not Authenticode-signed, so Windows SmartScreen may show an unknown-publisher warning. The project is preparing for SignPath Foundation signing; the [code signing policy](CODE_SIGNING_POLICY.md) records the status, roles, provenance controls, and verification procedure without claiming that older unsigned binaries are signed. Even a future correctly signed build can initially receive a SmartScreen reputation warning while the new application establishes reputation.
 
-SpaceLens 1.6 uses a validated v7 cache and can migrate v6, v5, v4, and v3 saved scans from earlier releases. Existing NTFS checkpoints are retained for compatibility, but 1.6.1 does not activate the elevated refresh helper.
+SpaceLens 1.6.2 uses a validated v8 cache and automatically reclassifies compatible v7, v6, v5, v4, and v3 saved scans from earlier releases. Existing NTFS checkpoints are retained for compatibility, but 1.6.2 does not activate the elevated refresh helper. Folder/game totals work with a migrated completed scan; choose **Scan now** when the files on disk may have changed.
 
 **1.6.1 security bootstrap:** the previous development signing key was retired and replaced with a new non-exportable, user-protected CNG key. Because 1.6.0 and earlier cannot securely authenticate this trust-anchor change, they must install 1.6.1 manually from the official GitHub release and verify its SHA-256 sidecar; do not rely solely on the old in-app update prompt for this transition. Later releases can again use the new key pinned by 1.6.1.
 

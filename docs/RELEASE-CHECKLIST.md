@@ -1,13 +1,13 @@
 # Release checklist
 
 - [ ] Version is strict `MAJOR.MINOR.PATCH` everywhere.
-- [ ] SignPath is marked not applicable for 1.6.1: the safety-locked placeholder remains inert, has no secrets/actions, and was not enabled for this release.
+- [ ] SignPath is marked not applicable for the current release: the safety-locked placeholder remains inert, has no secrets/actions, and was not enabled for this release.
 - [ ] No previously published or signed tag was moved or reused.
 - [ ] Release notes and changelog are updated.
 - [ ] Application and Setup publish successfully with zero build errors.
 - [ ] Application packaged self-test passes.
 - [ ] Setup packaged self-test passes.
-- [ ] For 1.6.1, the historical Full access/UAC integration probe is marked not applicable while the production feature gate is false.
+- [ ] The historical Full access/UAC integration probe is marked not applicable while the production feature gate is false.
 - [ ] Every retired helper command-line/IPC entry point rejects activation; standard installed and portable scans remain unelevated.
 - [ ] Published SpaceLens passes the harmless `DOTNET_STARTUP_HOOKS` rejection probe and no marker is created.
 - [ ] Recycle Bin integration test passes for multiple disposable files.

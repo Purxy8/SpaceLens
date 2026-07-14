@@ -174,16 +174,15 @@ internal static class FastFileScanner
         {
             if (isReparsePoint)
             {
-                bool cloudDirectory = entry.ReparseTagKnown
-                    ? IsCloudTag(entry.ReparseTag)
-                    : IsCloudDirectory(path);
-                if (!cloudDirectory
-                    || !NativeResolvedPath.TryResolveDirectory(path, out string resolvedDirectory, out _)
-                    || !NativeResolvedPath.IsStrictlyUnder(resolvedDirectory, scanRoot)
-                    || !NativeFileIdentity.TryGet(resolvedDirectory, true, out NativeFileInformation resolvedIdentity)
-                    || (rootVolume != 0 && resolvedIdentity.Id.VolumeSerial != rootVolume)) { skipped++; return; }
+                // Ordinary junctions/symlinks are never followed. For a Cloud
+                // Files placeholder, hold an OPEN_REPARSE_POINT guard that
+                // denies write/delete sharing while resolving the followed
+                // handle, then require a stable same-volume identity strictly
+                // inside the canonical root.
+                if (strictReparseDirectories
+                    || !TryResolveVerifiedCloudDirectory(path, scanRoot, rootVolume, out string resolvedDirectory, out NativeFileId resolvedId)) { skipped++; return; }
                 path = resolvedDirectory;
-                id = resolvedIdentity.Id;
+                id = resolvedId;
             }
             if (id.FileIndex != 0 && !visitedDirectories.Add(id)) { skipped++; return; }
             traversalBudget.Queue(pending, new(path, id));
@@ -244,13 +243,12 @@ internal static class FastFileScanner
                     string candidate = child;
                     var info = new DirectoryInfo(candidate);
                     bool reparse = (info.Attributes & FileAttributes.ReparsePoint) != 0;
+                    NativeFileId childId = default;
                     if (reparse)
                     {
-                        if (!IsCloudDirectory(candidate)
-                            || !NativeResolvedPath.TryResolveDirectory(candidate, out candidate, out _)
-                            || !NativeResolvedPath.IsStrictlyUnder(candidate, scanRoot)) { skipped++; continue; }
+                        if (strictReparseDirectories
+                            || !TryResolveVerifiedCloudDirectory(candidate, scanRoot, rootVolume, out candidate, out childId)) { skipped++; continue; }
                     }
-                    NativeFileId childId = default;
                     if (NativeFileIdentity.TryGet(candidate, true, out var identity))
                     {
                         if ((rootVolume != 0 && identity.Id.VolumeSerial != rootVolume) || !visitedDirectories.Add(identity.Id)) { skipped++; continue; }
@@ -325,17 +323,6 @@ internal static class FastFileScanner
         catch (OperationCanceledException) { return true; }
     }
 
-    private static bool IsCloudDirectory(string path)
-    {
-        try
-        {
-            using SafeFileHandle handle = CreateFileW(NativePath.For(path), 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
-            if (handle.IsInvalid || !GetFileInformationByHandleEx(handle, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())) return false;
-            return IsCloudTag(information.ReparseTag);
-        }
-        catch { return false; }
-    }
-
     private static bool IsFileLink(string path)
     {
         try { return new FileInfo(path).LinkTarget is not null; }
@@ -344,17 +331,44 @@ internal static class FastFileScanner
 
     private static bool IsCloudTag(uint tag) => (tag & CloudTagMask) == CloudTagBase;
 
+    private static bool TryResolveVerifiedCloudDirectory(string path, string scanRoot, uint rootVolume, out string resolvedDirectory, out NativeFileId resolvedId)
+    {
+        resolvedDirectory = string.Empty;
+        resolvedId = default;
+        if (rootVolume == 0) return false;
+        try
+        {
+            using SafeFileHandle guard = CreateFileW(NativePath.For(path), 0, FileShare.Read, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (guard.IsInvalid
+                || !GetFileInformationByHandleEx(guard, 9, out FileAttributeTagInformation information, (uint)Marshal.SizeOf<FileAttributeTagInformation>())
+                || (information.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != (FileAttributes.Directory | FileAttributes.ReparsePoint)
+                || !IsCloudTag(information.ReparseTag)
+                || !NativeResolvedPath.TryResolveDirectory(path, out resolvedDirectory, out _)
+                || !NativeResolvedPath.IsStrictlyUnder(resolvedDirectory, scanRoot)
+                || !NativeFileIdentity.TryGet(resolvedDirectory, true, out NativeFileInformation identity)
+                || identity.Id.VolumeSerial != rootVolume) return false;
+            resolvedId = identity.Id;
+            return true;
+        }
+        catch { resolvedDirectory = string.Empty; resolvedId = default; return false; }
+    }
+
     private static bool IsNameSurrogateTag(uint tag) => (tag & ReparseTagNameSurrogate) != 0;
 
-    private static bool IsWholeVolumeRoot(string path)
+    internal static bool IsWholeVolumeRoot(string path)
     {
         try
         {
             string fullPath = Path.GetFullPath(path);
             string? root = Path.GetPathRoot(fullPath);
             string full = fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            return root is not null
-                && full.Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+            if (root is null
+                || full.Length != 2
+                || !char.IsAsciiLetter(full[0])
+                || full[1] != ':'
+                || !full.Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)) return false;
+            DriveType type = new DriveInfo(root).DriveType;
+            return type is DriveType.Fixed or DriveType.Removable or DriveType.Ram;
         }
         catch { return false; }
     }

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.6.2 — 2026-07-14
+
+- Added a virtualized **Folders & games** view that aggregates every matching indexed file instead of relying on the 10,000-row largest-file display, so large installations split across thousands of smaller files show their complete totals.
+- Added fast detection and one-click drill-down for Steam, Xbox, Epic, GOG, EA, Ubisoft, Riot, WindowsApps, Program Files, and common drive-root game libraries, plus ordinary scan-root folder browsing for custom locations.
+- Kept category, media, search, and folder-size sorting fully composable; exact game-folder scans and cache/log filters now remain visible under the correct installation.
+- Defaulted folder results to logical file-size totals while separately showing unique physical allocation, explicit estimates, and shared-hard-link ambiguity.
+- Reduced folder-view UI work, bounded folder aggregation memory, cached recently detected install roots, and added 200,000-file performance coverage.
+- Added v8 saved scans with automatic v7-and-older category/safety reclassification, clearer scan-coverage warnings, and safer cleanup-candidate precedence.
+- Hardened cloud-placeholder traversal with a guarded reparse handle and same-volume identity validation, kept ordinary junctions/symlinks excluded, and restricted whole-volume shortcuts to verified local DOS drives.
+- Expanded regression tests for an 80 GB multi-file game hidden from the largest-file list, exact-root scans, folder filter composition, false install markers, hard links, UNC roots, and legacy caches.
+
 ## 1.6.1 — 2026-07-13
 
 - Retired and removed the obsolete development private key, completed a one-shot maintainer-run CNG trust rotation, and enrolled a new public key plus freshly signed self-test fixture. Upgrading from 1.6.0 or earlier requires one manual installer download from the official GitHub release.

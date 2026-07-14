@@ -63,7 +63,7 @@ For each download, first verify the GitHub API's digest of the outer Actions art
 
 This workflow trusts the reviewed pinned GitHub actions, the exact .NET SDK version, and the GitHub-hosted Windows runner image. Separate artifacts and digests prevent accidental substitution and detect transport corruption; they are not an independent rebuild or a defense against a compromised hosted builder. A future release process can add a separately operated reproducible build comparison or artifact attestation without granting the product-build job any signing secret.
 
-SpaceLens 1.6.1 intentionally disables Full access/UAC while a native broker is designed. The historical elevated probe is not applicable. Verify instead that helper entry points reject activation and that normal app, update, cleanup, install, and uninstall flows remain unelevated. Version 1.6.1 never requests UAC; cancel and report any unexpected prompt.
+SpaceLens 1.6.2 keeps Full access/UAC disabled while a native broker is designed. The historical elevated probe is not applicable. Verify instead that helper entry points reject activation and that normal app, update, cleanup, install, and uninstall flows remain unelevated. Version 1.6.2 never requests UAC; cancel and report any unexpected prompt.
 
 ## Offline CNG finalization
 
@@ -92,7 +92,7 @@ The release directory contains exactly seven assets:
 
 ## SignPath status
 
-No usable SignPath workflow exists for 1.6.1. The previous design mixed execution of repository-built product bytes with later secret access on one runner and was retired. `.github/workflows/sign-release.yml` is an inert literal-false placeholder with no checkout, third-party actions, or secrets.
+No usable SignPath workflow exists for 1.6.2. The previous design mixed execution of repository-built product bytes with later secret access on one runner and was retired. `.github/workflows/sign-release.yml` is an inert literal-false placeholder with no checkout, third-party actions, or secrets.
 
 SignPath approval alone is not permission to enable it. A future implementation requires a separate audit and three fresh jobs: a no-secrets/read-only build and self-test job producing a digest-bound artifact; a fresh secret-only signing job that never executes repository/product code and gives the token only to an immutable-SHA-pinned signing action; and a fresh no-secret validation job. Retained SignPath scripts/configurations are experimental and non-runnable until that design exists.
 
